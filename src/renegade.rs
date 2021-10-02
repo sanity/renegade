@@ -1,13 +1,11 @@
-pub struct Renegade {
-
-} 
+use pav_regression::pav::IsotonicRegression;
 
 pub trait Labelled {
     fn label(&self) -> &str;
 }
 
 pub trait Metric<InputType> {
-    fn distance(&self, input_a : InputType, input_b : InputType) -> f64;
+    fn distance(&self, input_a: InputType, input_b: InputType) -> f64;
 }
 
 pub trait Row<InputType, OutputType> {
@@ -15,30 +13,26 @@ pub trait Row<InputType, OutputType> {
     fn output(&self) -> OutputType;
 }
 
-impl Renegade {
-    pub fn new<InputType, OutputType, InstanceType, TrainingDataType, MetricType>(
-        training_data : TrainingDataType, 
-        input_metrics : Vec<Box<MetricType>>,
-        output_metric : Box<dyn Metric<OutputType>>,    
-    ) -> Renegade 
-    where 
-     InstanceType : Row<InputType, OutputType>,
-     TrainingDataType : IntoIterator<Item = InstanceType>,
-     MetricType : Metric<InputType> + Labelled, {
-         
-        Renegade {}
-    }
+pub trait Learner {
+    type InputType;
+    type OutputType;
+    type InstanceType: Row<Self::InputType, Self::OutputType>;
+    type TrainingDataType: IntoIterator<Item = Self::InstanceType>;
+    type MetricType: Metric<Self::InputType> + Labelled;
 
-    pub fn learn_metrics<InputType, OutputType, InstanceType, TrainingDataType, MetricType>(
-        training_data : TrainingDataType, 
-        input_metrics : Vec<Box<MetricType>>,
-        output_metric : Box<dyn Metric<OutputType>>,    
-    ) -> MetricType 
-    where 
-     InstanceType : Row<InputType, OutputType>,
-     TrainingDataType : IntoIterator<Item = InstanceType>,
-     MetricType : Metric<InputType> + Labelled, {
-         
-        todo!()
+    fn learn_metrics(
+        &self,
+        training_data: Self::TrainingDataType,
+        input_metrics: Vec<Box<Self::MetricType>>,
+        output_metric: Box<dyn Metric<Self::OutputType>>,
+    ) -> Self::MetricType {
+        let mut metrics : Vec<LearnedMetric<Self::InputType>> = vec!();
+        
+        todo!();
     }
+}
+
+struct LearnedMetric<InputType> {
+    regression : IsotonicRegression,
+    inputMetric : Box<dyn Metric<InputType>>,
 }
