@@ -1,9 +1,6 @@
 extern crate pav_regression;
 
-use log::info;
-
 pub mod renegade;
-
 #[cfg(test)]
 mod tests {
     use super::*;
