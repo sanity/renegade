@@ -13,6 +13,5 @@ mod tests {
     fn it_works() {
         init();
         assert_eq!(2 + 2, 4);
-        info!("test");
     }
 }

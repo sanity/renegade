@@ -1,6 +1,7 @@
 use pav_regression::pav::{IsotonicRegression, Point};
 use rand::Rng;
 use rayon::prelude::*;
+use std::cell::*;
 use std::sync::RwLock;
 
 pub trait Labelled {
@@ -28,7 +29,8 @@ pub trait Learner {
             output_metric,
             config.sample_count,
         );
-        let mut initial_regressions = RwLock::new(Self::create_initial_regressions(distance_samples));
+        let mut initial_regressions =
+            RwLock::new(Self::create_initial_regressions(distance_samples));
 
         todo!();
     }
@@ -61,55 +63,71 @@ pub trait Learner {
     }
 
     fn create_initial_regressions(
-        distance_samples : Vec<(Vec<f64>, f64)>,
+        distance_samples: Vec<(Vec<f64>, f64)>,
     ) -> Vec<IsotonicRegression> {
         let num_input_metrics = distance_samples.first().unwrap().0.len();
-        distance_samples.par_iter().map(|(input_distances, output_distance)| {
-            let mut points : Vec<Point> = vec!();
-            for input_dist in input_distances {
-                points.push(Point::new(*input_dist, output_distance / num_input_metrics as f64));
-            }
-            IsotonicRegression::new_ascending(&points)
-        }).collect()
+        distance_samples
+            .par_iter()
+            .map(|(input_distances, output_distance)| {
+                let mut points: Vec<Point> = vec![];
+                for input_dist in input_distances {
+                    points.push(Point::new(
+                        *input_dist,
+                        output_distance / num_input_metrics as f64,
+                    ));
+                }
+                IsotonicRegression::new_ascending(&points)
+            })
+            .collect()
     }
 
     fn refine_regressions(
-        distance_samples : Vec<(Vec<f64>, f64)>,
-        regressions : RwLock<&mut Vec<IsotonicRegression>>,
+        distance_samples: Vec<(Vec<f64>, f64)>,
+        regressions: RwLock<Vec<IsotonicRegression>>,
     ) -> f64 {
-        let num_input_metrics = distance_samples.first().unwrap().0.len();
-        let points_array : RwLock<Vec<Vec<Point>>> = RwLock::new(vec![vec![]; num_input_metrics]);
-        distance_samples.par_iter().for_each(|(input_distances, actual_output)| {
-            let estimated_output_parts : Vec<f64> = input_distances.iter().enumerate().map(|(ix, input_dist)| {
-                let regression : &IsotonicRegression = &regressions.read().unwrap()[ix];
-                regression.interpolate(input_dist)
-            }).collect();
+        let point_vectors = Self::calculate_point_vectors(&distance_samples, &regressions);
+        let refined_regressions: Vec<IsotonicRegression> = point_vectors
+            .read()
+            .unwrap()
+            .par_iter()
+            .map(|points| -> IsotonicRegression { IsotonicRegression::new_ascending(&points) })
+            .collect();
 
-            let estimated_output : f64 = estimated_output_parts.iter().sum();
-
-            for (ix, part) in estimated_output_parts.iter().enumerate() {
-                let estimated_output_without_this = estimated_output-part;
-                let correction = actual_output - estimated_output_without_this;
-                points_array.write().unwrap()[ix].push(Point::new(input_distances[ix], correction));
-            }
-            
-
-        });
-
-        let newRegressions : Vec<IsotonicRegression> = points_array.read().unwrap().par_iter().map(|points| -> IsotonicRegression {
-            IsotonicRegression::new_ascending(&points)
-        }
-        ).collect();
-
-        let mut r = regressions.write().unwrap();
-        r.clear();
-        for (ix, new_regression) in newRegressions.iter().enumerate() {
-            r[ix] = new_regression.clone();
-        }
+        let mut writable_regressions = regressions.write().unwrap();
+        *writable_regressions = refined_regressions;
 
         todo!();
     }
 
+    fn calculate_point_vectors(
+        distance_samples: &Vec<(Vec<f64>, f64)>,
+        regressions: &RwLock<Vec<IsotonicRegression>>,
+    ) -> RwLock<Vec<Vec<Point>>> {
+        let num_input_metrics = distance_samples.first().unwrap().0.len();
+        let point_vectors: RwLock<Vec<Vec<Point>>> = RwLock::new(vec![vec![]; num_input_metrics]);
+        distance_samples
+            .par_iter()
+            .for_each(|(input_distances, actual_output)| {
+                let estimated_output_parts: Vec<f64> = input_distances
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, input_dist)| {
+                        let regression: &IsotonicRegression = &regressions.read().unwrap()[ix];
+                        regression.interpolate(input_dist)
+                    })
+                    .collect();
+
+                let estimated_output: f64 = estimated_output_parts.iter().sum();
+
+                for (ix, part) in estimated_output_parts.iter().enumerate() {
+                    let estimated_output_without_this = estimated_output - part;
+                    let correction = actual_output - estimated_output_without_this;
+                    point_vectors.write().unwrap()[ix]
+                        .push(Point::new(input_distances[ix], correction));
+                }
+            });
+        point_vectors
+    }
 }
 
 pub struct LearnerConfig {
