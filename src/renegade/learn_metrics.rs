@@ -1,7 +1,7 @@
 use std::sync::RwLock;
 
 use pav_regression::pav::{IsotonicRegression, Point};
-use rand::{Rng, prelude::ThreadRng, thread_rng};
+use rand::{prelude::ThreadRng, thread_rng, Rng};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use super::*;
@@ -19,8 +19,7 @@ where
 {
     let mut rng = thread_rng();
 
-    let (training_data, testing_data) =
-        split_train_test(&mut rng, config.train_test_prop, data);
+    let (training_data, testing_data) = split_train_test(&mut rng, config.train_test_prop, data);
 
     let training_samples = sample_distances(
         &mut rng,
@@ -37,9 +36,7 @@ where
         config.sample_count,
     );
 
-    let mut regressions = RwLock::new(create_initial_regressions(
-        &training_samples,
-    ));
+    let mut regressions = RwLock::new(create_initial_regressions(&training_samples));
 
     for iteration in 0..config.iterations {
         refine_regressions(&training_samples, &mut regressions);
@@ -112,9 +109,7 @@ fn calculate_point_vectors(
     point_vectors
 }
 
-fn create_initial_regressions(
-    distance_samples: &Vec<(Vec<f64>, f64)>,
-) -> Vec<IsotonicRegression> {
+fn create_initial_regressions(distance_samples: &Vec<(Vec<f64>, f64)>) -> Vec<IsotonicRegression> {
     let num_input_metrics = distance_samples.first().unwrap().0.len();
     distance_samples
         .par_iter()
@@ -197,22 +192,21 @@ mod tests {
 
     use crate::renegade::learn_metrics::*;
 
-    
-
     #[test]
     fn split_train_test_test() {
         let mut rng = thread_rng();
         let data = {
             let rng: &mut ThreadRng = &mut rng;
-            let mut data : Vec<(f64, f64)> = vec![];
-            for _ in 0 .. 100 {
+            let mut data: Vec<(f64, f64)> = vec![];
+            for _ in 0..100 {
                 data.push((rng.gen(), rng.gen()));
             }
             data
         };
-        let (train, test) : (Vec<(f64, f64)>, Vec<(f64, f64)>)= split_train_test(&mut rng, 0.5, &data);
-        assert!((35 .. 55).contains(&train.len()));
-        assert!((35 .. 55).contains(&test.len()));
+        let (train, test): (Vec<(f64, f64)>, Vec<(f64, f64)>) =
+            split_train_test(&mut rng, 0.5, &data);
+        assert!((35..55).contains(&train.len()));
+        assert!((35..55).contains(&test.len()));
         assert!(train.len() + test.len() == 100);
     }
 
@@ -221,15 +215,20 @@ mod tests {
         let mut rng = thread_rng();
         let data = {
             let rng: &mut ThreadRng = &mut rng;
-            let mut data : Vec<((f64, f64), f64)> = vec![];
-            for _ in 0 .. 100 {
-                let a: f64 = rng.gen_range(0.0 .. 1.0);
-                let b: f64 = rng.gen_range(0.0 .. 1.0);
+            let mut data: Vec<((f64, f64), f64)> = vec![];
+            for _ in 0..100 {
+                let a: f64 = rng.gen_range(0.0..1.0);
+                let b: f64 = rng.gen_range(0.0..1.0);
 
-                data.push(((a, b), a*b));
+                data.push(((a, b), a * b));
             }
             data
         };
+    }
 
+    impl Metric<(f64, f64)> for (f64, f64) {
+        fn distance(&self, input_a: &(f64, f64), input_b: &(f64, f64)) -> f64 {
+            todo!()
+        }
     }
 }
