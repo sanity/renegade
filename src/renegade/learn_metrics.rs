@@ -234,6 +234,7 @@ mod tests {
         assert_eq!(initial_regressions.len(), 1);
 
         for point in initial_regressions[0].get_points() {
+            // Verify that input and output distances are the same
             assert_eq!(point.x(), point.y());
         }
 
