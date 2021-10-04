@@ -6,16 +6,15 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use super::*;
 
-pub(crate) fn learn_metrics<InputType, OutputType, MetricType>(
+pub(crate) fn learn_metrics<InputType, OutputType>(
     data: &Vec<(InputType, OutputType)>,
-    input_metrics: &Vec<Box<MetricType>>,
-    output_metric: &Box<dyn Metric<OutputType>>,
+    input_metrics: fn(&InputType, &InputType) -> Vec<f64>,
+    output_metric: fn(&OutputType, &OutputType) -> f64,
     config: &LearnerConfig,
 ) -> RwLock<Vec<IsotonicRegression>>
 where
     InputType: Copy,
     OutputType: Copy,
-    MetricType: Metric<InputType> + Sync,
 {
     let mut rng = thread_rng();
 
@@ -47,17 +46,16 @@ where
     regressions
 }
 
-fn sample_distances<InputType, OutputType, MetricType>(
+fn sample_distances<InputType, OutputType>(
     rng: &mut ThreadRng,
     training_data: &Vec<(InputType, OutputType)>,
-    input_metrics: &Vec<Box<MetricType>>,
-    output_metric: &Box<dyn Metric<OutputType>>,
+    input_metrics: fn(&InputType, &InputType) -> Vec<f64>,
+    output_metric: fn(&OutputType, &OutputType) -> f64,
     sample_count: usize,
 ) -> Vec<(Vec<f64>, f64)>
 where
     InputType: Copy,
     OutputType: Copy,
-    MetricType: Metric<InputType> + Sync,
 {
     assert!(sample_count < training_data.len() * (training_data.len() - 1));
 
@@ -68,11 +66,8 @@ where
         if a_ix != b_ix {
             let a = &training_data[a_ix];
             let b = &training_data[b_ix];
-            let output_distance = output_metric.distance(&a.1, &b.1);
-            let mut input_distances: Vec<f64> = vec![];
-            for metric in input_metrics {
-                input_distances.push(metric.distance(&a.0, &b.0));
-            }
+            let output_distance = output_metric(&a.1, &b.1);
+            let mut input_distances: Vec<f64> = input_metrics(&a.0, &b.0);
             samples.push((input_distances, output_distance));
         }
     }

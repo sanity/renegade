@@ -2,16 +2,15 @@ mod learn_metrics;
 
 use pav_regression::pav::IsotonicRegression;
 
-pub fn build_model<InputType, OutputType, MetricType>(
-    data: &Vec<(InputType, OutputType)>,
-    input_metrics: &Vec<Box<MetricType>>,
-    output_metric: &Box<dyn Metric<OutputType>>,
+pub fn build_model<InputType, OutputType>(
+    data: &Vec<(InputType, OutputType)>,    
+    input_metrics: fn(&InputType, &InputType) -> Vec<f64>,
+    output_metric: fn(&OutputType, &OutputType) -> f64,
     config: &LearnerConfig,
 ) -> Vec<IsotonicRegression>
 where
     InputType: Copy,
     OutputType: Copy,
-    MetricType: Metric<InputType> + Labelled + Sync,
 {
     learn_metrics::learn_metrics(data, input_metrics, output_metric, config);
     todo!();
