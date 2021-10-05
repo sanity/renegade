@@ -1,7 +1,6 @@
 extern crate pav_regression;
 
 mod renegade;
-mod mvp;
 
 #[cfg(test)]
 mod tests {
