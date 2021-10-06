@@ -1,4 +1,5 @@
 extern crate pav_regression;
+extern crate bit_vec;
 
 mod renegade;
 
