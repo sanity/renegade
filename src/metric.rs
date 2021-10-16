@@ -1,7 +1,7 @@
 use std::sync::RwLock;
 
 use pav_regression::pav::{IsotonicRegression, Point};
-use rand::{prelude::ThreadRng, thread_rng, Rng};
+use rand::prelude::*;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use super::*;
@@ -183,7 +183,7 @@ fn test_regressions(
 mod tests {
     use rand::{thread_rng, Rng};
 
-    use crate::renegade::learn_metrics::*;
+    use crate::metric::*;
 
     #[test]
     fn split_train_test_test() {

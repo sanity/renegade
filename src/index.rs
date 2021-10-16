@@ -25,11 +25,11 @@ impl<I: Clone + PartialEq<I>> WaypointIndex<I> {
         for _ in 0..waypoint_count {
             let mut first_best: Option<((I, I), f64, BitVec)> = Option::None;
             for _ in 0..sample_count {
-                let waypoint = Self::random_distance_pair(rng, data);
-                let correlations: BitVec = Self::calc_correlations(dist, &samples, &waypoint);
-                let score = Self::calc_score(&waypoint_samples, &correlations);
+                let waypoint_candidate = Self::random_distance_pair(rng, data);
+                let correlations: BitVec = Self::calc_sides(dist, &samples, &waypoint_candidate);
+                let score = calc_score(&waypoint_samples, &correlations);
                 if first_best.is_none() || first_best.as_ref().unwrap().1 < score {
-                    first_best = Option::Some((waypoint, score, correlations));
+                    first_best = Option::Some((waypoint_candidate, score, correlations));
                 }
             }
 
@@ -67,37 +67,9 @@ impl<I: Clone + PartialEq<I>> WaypointIndex<I> {
         }
     }
 
-    fn calc_score(sample_correlations: &Vec<BitVec>, correlations: &BitVec) -> f64 {
-        let mut true_count: usize = 0;
-        let mut match_counts: Vec<usize> = vec![sample_correlations.len(); 0];
-        for (cix, c) in correlations.iter().enumerate() {
-            if c {
-                true_count += 1;
-            }
-            let samples = &sample_correlations[cix];
-            for sam in samples {
-                if sam {
-                    match_counts[cix] += 1;
-                }
-            }
-        }
-
-        let separation_score = count_to_score(true_count, correlations.len());
-
-        let correlation_score = match_counts
-            .iter()
-            .map(|s| count_to_score(*s, correlations.len()))
-            .min_by(|a, b| a.partial_cmp(b).unwrap());
-
-        match correlation_score {
-            None => separation_score,
-            Some(cs) => cs.min(separation_score),
-        }
-    }
-
     /// For a given waypoint determine which side of each sample it's on, results returned as BitVec
     /// same size as samples.len()
-    fn calc_correlations(dist: fn(&I, &I) -> f64, samples: &Vec<I>, waypoint: &(I, I)) -> BitVec {
+    fn calc_sides(dist: fn(&I, &I) -> f64, samples: &Vec<I>, waypoint: &(I, I)) -> BitVec {
         let mut bv = BitVec::new();
         for sample in samples {
             bv.push(Self::waypoint_side(dist, waypoint, sample));
@@ -118,6 +90,31 @@ impl<I: Clone + PartialEq<I>> WaypointIndex<I> {
 
 }
 
+fn calc_score(correlations_by_waypoint: &Vec<BitVec>, target_correlations: &BitVec) -> f64 {
+    let mut same_counts_by_waypoint: Vec<usize> = vec![correlations_by_waypoint.len(); 0];
+    for (waypoint_ix, waypoint_correlations) in correlations_by_waypoint.iter().enumerate() {
+        for (sample_ix, target_cor) in target_correlations.iter().enumerate() {
+            let sample_side_same_as_waypoint = !(waypoint_correlations[sample_ix] ^ target_cor);
+            if sample_side_same_as_waypoint { 
+                same_counts_by_waypoint[waypoint_ix] += 1;
+            }
+        }
+    }
+
+    let true_count: usize = target_correlations.iter().filter(|c| *c).count();
+    let separation_score = count_to_score(true_count, target_correlations.len());
+
+    let correlation_score = same_counts_by_waypoint
+        .iter()
+        .map(|s| count_to_score(*s, target_correlations.len()))
+        .min_by(|a, b| a.partial_cmp(b).unwrap());
+
+    match correlation_score {
+        None => separation_score,
+        Some(cs) => cs.min(separation_score),
+    }
+}
+
 fn count_to_score(true_count: usize, total: usize) -> f64 {
     let s = (true_count as f64) / (total as f64);
     if s > 0.5 {
@@ -130,14 +127,19 @@ fn count_to_score(true_count: usize, total: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::renegade::waypoint_index::WaypointIndex;
+    use crate::index::WaypointIndex;
+
+    #[test]
+    fn calc_score_test() {
+
+    }
 
     #[test]
     fn calc_correlations_test() {
         let samples = vec![1.0, 2.0, 3.0, 4.0];
         let waypoint = (2.4, 2.6);
         let correlations =
-            WaypointIndex::calc_correlations(|a, b| ((a - b) as f64).abs(), &samples, &waypoint);
+            WaypointIndex::calc_sides(|a, b| ((a - b) as f64).abs(), &samples, &waypoint);
         assert_eq!(correlations.len(), 4);
         assert_eq!(correlations[0], true);
         assert_eq!(correlations[1], true);
