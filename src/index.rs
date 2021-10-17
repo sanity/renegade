@@ -1,53 +1,57 @@
+use std::sync::RwLock;
+
 use bit_vec::BitVec;
 use rand::prelude::*;
+use rayon::iter::*;
 
 #[derive(Clone)]
-pub struct WaypointIndex<I: Clone + PartialEq<I>> {
+pub struct WaypointIndex<I: Clone + PartialEq<I> + ?Sized + Send + Sync> {
     waypoints: Vec<(I, I)>,
     dist: Box<fn(&I, &I) -> f64>,
 }
 
-impl<I: Clone + PartialEq<I>> WaypointIndex<I> {
+impl<I: Clone + PartialEq<I> + ?Sized + Send + Sync> WaypointIndex<I> {
     pub fn new(
         data: &Vec<I>,
         dist: fn(&I, &I) -> f64,
-        waypoint_count: usize,
-        item_samples: usize,
-        waypoint_samples: usize,
+        num_waypoints: usize,
+        num_item_samples: usize,
+        num_waypoint_samples: usize,
     ) -> WaypointIndex<I> {
         let mut rng = thread_rng();
         let samples = data
-            .choose_multiple(&mut rng, item_samples)
+            .choose_multiple(&mut rng, num_item_samples)
             .map(|x| x.clone())
             .collect();
 
-        let mut waypoints: Vec<(I, I)> = vec![];
-        let mut waypoint_samples: Vec<BitVec> = vec![BitVec::new(); waypoint_count];
-        for _ in 0..waypoint_count {
-            let mut first_best: Option<((I, I), f64, BitVec)> = Option::None;
-            for _ in 0..waypoint_samples {
-                let waypoint_candidate = Self::random_distance_pair(data);
-                let correlations: BitVec = Self::calc_sides(dist, &samples, &waypoint_candidate);
-                let score = calc_score(&waypoint_samples, &correlations);
-                if first_best.is_none() || first_best.as_ref().unwrap().1 < score {
-                    first_best = Option::Some((waypoint_candidate, score, correlations));
-                }
-            }
+        let waypoints: RwLock<Vec<(I, I)>> = RwLock::new(vec![]);
+        let waypoint_samples: RwLock<Vec<BitVec>> = RwLock::new(vec![BitVec::new(); num_waypoints]);
+        for _ in 0..num_waypoints {
+            // let mut first_best: Option<((I, I), f64, BitVec)> = Option::None;
+            let best = repeat(num_waypoint_samples)
+                .map(|_| {
+                    let waypoint_candidate = Self::random_distance_pair(data);
+                    let correlations: BitVec =
+                        Self::calc_sides(dist, &samples, &waypoint_candidate);
+                    let score = calc_score(&waypoint_samples.read().unwrap(), &correlations);
+                    (waypoint_candidate, score, correlations)
+                })
+                .max_by_key(|f| f.2.clone());
 
-            match first_best {
+            match best {
                 Some((waypoint, _, c)) => {
-                    waypoints.push(waypoint);
-                    waypoint_samples.push(c);
+                    waypoints.write().unwrap().push(waypoint);
+                    waypoint_samples.write().unwrap().push(c);
                 }
                 None => {
                     panic!("Unable to find waypoint")
                 }
             }
         }
-        WaypointIndex {
-            waypoints,
+        let x = WaypointIndex {
+            waypoints: waypoints.read().unwrap().clone(),
             dist: Box::new(dist),
-        }
+        }; x
     }
 
     pub fn calc_lsh(&self, item: &I) -> BitVec {
