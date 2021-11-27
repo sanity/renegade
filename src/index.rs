@@ -2,33 +2,34 @@ use std::sync::RwLock;
 
 use bit_vec::BitVec;
 use rand::prelude::*;
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use rayon::iter::*;
 
 #[derive(Clone)]
-pub struct WaypointIndex<I: Clone + PartialEq<I> + ?Sized + Send + Sync> {
+pub struct WaypointIndex<I: Clone + PartialEq<I> + Send + Sync> {
     waypoints: Vec<(I, I)>,
     dist: Box<fn(&I, &I) -> f64>,
 }
 
 impl<I: Clone + PartialEq<I> + ?Sized + Send + Sync> WaypointIndex<I> {
     pub fn new(
-        data: &Vec<I>,
+        data: &[I],
         dist: fn(&I, &I) -> f64,
         num_waypoints: usize,
         num_item_samples: usize,
         num_waypoint_samples: usize,
     ) -> WaypointIndex<I> {
-        let mut rng = thread_rng();
+        let mut rng = SmallRng::from_entropy();
         let samples = data
             .choose_multiple(&mut rng, num_item_samples)
-            .map(|x| x.clone())
+            .cloned()
             .collect();
 
         let waypoints: RwLock<Vec<(I, I)>> = RwLock::new(vec![]);
         let waypoint_samples: RwLock<Vec<BitVec>> = RwLock::new(vec![BitVec::new(); num_waypoints]);
-        for _ in 0..num_waypoints {
-            // let mut first_best: Option<((I, I), f64, BitVec)> = Option::None;
-            let best = repeat(num_waypoint_samples)
+        for waypoint_no in 0..num_waypoints {
+            let best = repeatn((), num_waypoint_samples)
                 .map(|_| {
                     let waypoint_candidate = Self::random_distance_pair(data);
                     let correlations: BitVec =
@@ -44,14 +45,16 @@ impl<I: Clone + PartialEq<I> + ?Sized + Send + Sync> WaypointIndex<I> {
                     waypoint_samples.write().unwrap().push(c);
                 }
                 None => {
-                    panic!("Unable to find waypoint")
+                    panic!("Unable to find {}th waypoint", waypoint_no);
                 }
             }
         }
-        let x = WaypointIndex {
+        // let is needed due to borrower issue I don't understand
+        let waypoint_index = WaypointIndex {
             waypoints: waypoints.read().unwrap().clone(),
             dist: Box::new(dist),
-        }; x
+        };
+        waypoint_index
     }
 
     pub fn calc_lsh(&self, item: &I) -> BitVec {
@@ -62,8 +65,8 @@ impl<I: Clone + PartialEq<I> + ?Sized + Send + Sync> WaypointIndex<I> {
         bv
     }
 
-    fn random_distance_pair(vec: &Vec<I>) -> (I, I) {
-        let mut rng = thread_rng();
+    fn random_distance_pair(vec: &[I]) -> (I, I) {
+        let mut rng = SmallRng::from_entropy();
         loop {
             let a = vec[rng.gen_range(0..vec.len())].clone();
             let b = vec[rng.gen_range(0..vec.len())].clone();
@@ -91,7 +94,7 @@ impl<I: Clone + PartialEq<I> + ?Sized + Send + Sync> WaypointIndex<I> {
     }
 }
 
-fn calc_score(correlations_by_waypoint: &Vec<BitVec>, target_correlations: &BitVec) -> f64 {
+fn calc_score(correlations_by_waypoint: &[BitVec], target_correlations: &BitVec) -> f64 {
     let mut same_counts_by_waypoint: Vec<usize> = vec![correlations_by_waypoint.len(); 0];
     for (waypoint_ix, waypoint_correlations) in correlations_by_waypoint.iter().enumerate() {
         for (sample_ix, target_cor) in target_correlations.iter().enumerate() {
@@ -152,3 +155,4 @@ mod tests {
         assert_eq!(count_to_score(6, 10), 0.4);
     }
 }
+

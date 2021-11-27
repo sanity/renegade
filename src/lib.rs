@@ -1,39 +1,47 @@
 extern crate bit_vec;
+extern crate env_logger;
+extern crate indicatif;
+extern crate log;
 extern crate pav_regression;
+extern crate tracing;
+extern crate rand;
+extern crate ordered_float;
+extern crate chrono;
 
-pub mod metric;
 pub mod index;
+pub mod metric;
+pub mod opt;
 
-use pav_regression::pav::IsotonicRegression;
+use index::*;
+use metric::*;
 
-pub fn build_model<InputType, OutputType>(
-    data: &Vec<(InputType, OutputType)>,
-    input_metrics: fn(&InputType, &InputType) -> Vec<f64>,
-    output_metric: fn(&OutputType, &OutputType) -> f64,
-    config: &LearnerConfig,
-) -> Vec<IsotonicRegression>
+pub struct Model<InputType, OutputType>
 where
-    InputType: Copy,
-    OutputType: Copy,
+    InputType: Clone + PartialEq<InputType> + ?Sized + Send + Sync,
+    OutputType: Clone,
 {
-    metric::learn_metrics(data, input_metrics, output_metric, config);
-    todo!();
+    metric: LearnedMetric<InputType, OutputType>,
+    index: WaypointIndex<InputType>,
+}
+
+impl<InputType, OutputType> Model<InputType, OutputType>
+where
+    InputType: Clone + PartialEq<InputType> + ?Sized + Send + Sync,
+    OutputType: Clone,
+{
+
 }
 
 pub trait Labelled {
     fn label(&self) -> &str;
 }
 
-pub trait Metric<InputType> {
-    fn distance(&self, input_a: &InputType, input_b: &InputType) -> f64;
-}
-
 pub struct LearnerConfig {
-    sample_count: usize,
-    train_test_prop: f64,
-    iterations: u32,
+    pub sample_count: usize,
+    pub train_test_prop: f64,
+    pub iterations : usize,
+    pub learning_rate: f64,
 }
-
 
 #[cfg(test)]
 mod tests {
