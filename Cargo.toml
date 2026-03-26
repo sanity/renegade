@@ -1,9 +1,12 @@
 [package]
-name = "renegade"
+name = "renegade-ml"
 version = "0.2.0"
 edition = "2021"
-description = "A nonparametric supervised learning library based on KNN"
+description = "Zero-config nonparametric supervised learning — KNN with auto-tuned K, metric learning, and VP-tree indexing"
 license = "AGPL-3.0-or-later"
+repository = "https://github.com/sanity/renegade"
+keywords = ["machine-learning", "knn", "nonparametric", "classification", "regression"]
+categories = ["science", "algorithms"]
 
 [dependencies]
 pav_regression = "0.7"
