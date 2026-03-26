@@ -1,346 +1,261 @@
-use std::sync::RwLock;
+use pav_regression::{IsotonicRegression, Point as PavPoint};
 
-use indicatif::{ParallelProgressIterator, ProgressBar, ProgressIterator};
-use log::info;
-use pav_regression::pav::{IsotonicRegression, Point};
-use rand::prelude::*;
-use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-use tracing::*;
-
-use super::*;
-
-pub struct LearnedMetric<InputType, OutputType>
-where
-    InputType: Clone,
-    OutputType: Clone,
-{
-    input_metrics: fn(&InputType, &InputType) -> Vec<f64>,
-    output_metric: fn(&OutputType, &OutputType) -> f64,
-    regressions: RwLock<Vec<IsotonicRegression>>,
+/// A learned distance metric that transforms features into "effect space" before
+/// computing distances.
+///
+/// For each feature, fits a univariate isotonic regression: feature_value → output.
+/// This learns each feature's marginal effect on the output. Distances are then
+/// computed in this effect space, where features that predict the output well
+/// contribute more to distance, and noise features (flat effect) contribute nothing.
+///
+/// This avoids the sign-cancellation problem of pair-wise distance learning:
+/// the isotonic regressions learn point-wise effects, not pair-wise distances.
+pub struct LearnedMetric {
+    /// One isotonic regression per feature: maps raw feature value → effect on output.
+    effect_regressions: Vec<IsotonicRegression<f64>>,
+    /// Weight per feature: proportion of output variance explained by this feature's effect.
+    weights: Vec<f64>,
 }
 
-impl<InputType, OutputType> LearnedMetric<InputType, OutputType>
-where
-    InputType: Clone,
-    OutputType: Clone,
-{
-    fn new(
-        data: &[(InputType, OutputType)],
-        input_metrics: fn(&InputType, &InputType) -> Vec<f64>,
-        output_metric: fn(&OutputType, &OutputType) -> f64,
-        config: &LearnerConfig,
-    ) -> LearnedMetric<InputType, OutputType> {
-        let regressions = learn_metrics(data, input_metrics, output_metric, config);
-        LearnedMetric {
-            input_metrics,
-            output_metric,
-            regressions,
+/// Training data for metric learning: raw feature values and output.
+pub struct TrainingPoint {
+    pub features: Vec<f64>,
+    pub output: f64,
+}
+
+impl LearnedMetric {
+    /// Learn a metric from training data.
+    ///
+    /// For each feature, fits an ascending isotonic regression from feature value to output.
+    /// Then computes feature weights based on how much output variance each feature explains.
+    pub fn learn(points: &[TrainingPoint]) -> Self {
+        if points.is_empty() {
+            return LearnedMetric {
+                effect_regressions: Vec::new(),
+                weights: Vec::new(),
+            };
         }
-    }
 
-    fn distance(&self, a: &InputType, b: &InputType) -> f64 {
-        let input_distances = (self.input_metrics)(a, b);
-        let mut output = 0.0;
-        let regressions = self.regressions.read().unwrap();
-        for (ix, distance) in input_distances.iter().enumerate() {
-            output += regressions[ix].interpolate(distance);
+        let num_features = points[0].features.len();
+        if num_features == 0 {
+            return LearnedMetric {
+                effect_regressions: Vec::new(),
+                weights: Vec::new(),
+            };
         }
-        output
-    }
-}
 
-pub fn learn_metrics<InputType, OutputType>(
-    data: &[(InputType, OutputType)],
-    input_metrics: fn(&InputType, &InputType) -> Vec<f64>,
-    output_metric: fn(&OutputType, &OutputType) -> f64,
-    config: &LearnerConfig,
-) -> RwLock<Vec<IsotonicRegression>>
-where
-    InputType: Clone,
-    OutputType: Clone,
-{
-    let _span = span!(Level::INFO, "learn_metrics", data_len = data.len()).entered();
+        // For each feature, try both ascending and descending isotonic regression.
+        // Keep whichever explains more variance (higher R²).
+        let mut effect_regressions = Vec::with_capacity(num_features);
+        let mut variances_explained = Vec::with_capacity(num_features);
 
-    let mut rng = SmallRng::from_entropy();
+        let mean_y: f64 = points.iter().map(|p| p.output).sum::<f64>() / points.len() as f64;
+        let ss_tot: f64 = points.iter().map(|p| (p.output - mean_y).powi(2)).sum();
 
-    let (training_data, testing_data) = split_train_test(&mut rng, config.train_test_prop, data);
-
-    let training_samples = {
-        let _span = span!(
-            Level::INFO,
-            "sample training distances",
-            training_data.len = training_data.len()
-        )
-        .entered();
-        sample_distances(
-            &mut rng,
-            &training_data,
-            input_metrics,
-            output_metric,
-            config.sample_count,
-        )
-    };
-
-    let testing_samples = {
-        let _span = span!(
-            Level::INFO,
-            "sample testing distances",
-            testing_data.len = testing_data.len()
-        )
-        .entered();
-        sample_distances(
-            &mut rng,
-            &testing_data,
-            input_metrics,
-            output_metric,
-            config.sample_count,
-        )
-    };
-
-    let mut regressions = RwLock::new(create_initial_regressions(&training_samples));
-    {
-        for iteration in 0..config.iterations {
-            let _span = span!(
-                Level::INFO,
-                "refining regressions",
-                iteration = iteration,
-                iterations = config.iterations
-            )
-            .entered();
-            refine_regressions(&training_samples, &mut regressions, config.learning_rate);
-            let rmse = test_regressions(&testing_samples, &regressions);
-            event!(Level::INFO, iteration = iteration, rmse = rmse);
-        }
-    }
-    regressions
-}
-
-type TrainTestData<InputType, OutputType> =
-    (Vec<(InputType, OutputType)>, Vec<(InputType, OutputType)>);
-
-fn split_train_test<InputType, OutputType>(
-    rng: &mut SmallRng,
-    train_test_prop: f64,
-    data: &[(InputType, OutputType)],
-) -> TrainTestData<InputType, OutputType>
-where
-    InputType: Clone,
-    OutputType: Clone,
-{
-    let mut training_data: Vec<(InputType, OutputType)> = vec![];
-    let mut testing_data: Vec<(InputType, OutputType)> = vec![];
-
-    for d in data {
-        if rng.gen_bool(train_test_prop) {
-            training_data.push(d.clone());
-        } else {
-            testing_data.push(d.clone());
-        }
-    }
-
-    (training_data, testing_data)
-}
-
-fn sample_distances<InputType, OutputType>(
-    rng: &mut SmallRng,
-    training_data: &[(InputType, OutputType)],
-    input_metrics: fn(&InputType, &InputType) -> Vec<f64>,
-    output_metric: fn(&OutputType, &OutputType) -> f64,
-    sample_count: usize,
-) -> Vec<(Vec<f64>, f64)>
-where
-    InputType: Clone,
-    OutputType: Clone,
-{
-    let _span = span!(Level::INFO, "sample_distances", sample_count = sample_count).entered();
-    assert!(sample_count < training_data.len() * (training_data.len() - 1));
-    let mut samples: Vec<(Vec<f64>, f64)> = vec![];
-    for _ in (0..sample_count).progress() {
-        let sample_pair: Vec<&(InputType, OutputType)> =
-            training_data.choose_multiple(rng, 2).collect();
-        let output_distance = output_metric(&sample_pair[0].1, &sample_pair[1].1);
-        let input_distances: Vec<f64> = input_metrics(&sample_pair[0].0, &sample_pair[1].0);
-        samples.push((input_distances, output_distance));
-    }
-    samples
-}
-
-fn create_initial_regressions(distance_samples: &[(Vec<f64>, f64)]) -> Vec<IsotonicRegression> {
-    let num_inputs = distance_samples.first().unwrap().0.len();
-    let mut points: Vec<Vec<Point>> = vec![vec![]; num_inputs];
-    for (input_distances, output_distance) in distance_samples {
-        for (ix, input_dist) in input_distances.iter().enumerate() {
-            let point = Point::new(*input_dist, output_distance / num_inputs as f64);
-            points[ix].push(point);
-        }
-    }
-    points
-        .par_iter()
-        .map(|points| IsotonicRegression::new_ascending(points))
-        .collect()
-}
-
-fn calculate_point_vectors(
-    distance_samples: &[(Vec<f64>, f64)],
-    regressions: &RwLock<Vec<IsotonicRegression>>,
-    learning_rate: f64,
-) -> RwLock<Vec<Vec<Point>>> {
-    let _span = span!(
-        Level::INFO,
-        "calculate_point_vectors",
-        regressions.len = regressions.read().unwrap().len(),
-    )
-    .entered();
-    let num_input_metrics = distance_samples.first().unwrap().0.len();
-    let point_vectors: RwLock<Vec<Vec<Point>>> = RwLock::new(vec![vec![]; num_input_metrics]);
-    distance_samples
-        .par_iter()
-        .progress_with(
-            ProgressBar::new(distance_samples.len() as u64)
-                .with_message("calculating point vectors across samples"),
-        )
-        .for_each(|(input_distances, actual_output)| {
-            let estimated_output_parts: Vec<f64> = input_distances
+        for f in 0..num_features {
+            let pav_points: Vec<PavPoint<f64>> = points
                 .iter()
-                .enumerate()
-                .map(|(ix, input_dist)| {
-                    let regression: &IsotonicRegression = &regressions.read().unwrap()[ix];
-                    regression.interpolate(input_dist)
-                })
+                .map(|p| PavPoint::new(p.features[f], p.output))
                 .collect();
 
-            let estimated_output: f64 = estimated_output_parts.iter().sum();
+            // Try ascending
+            let asc = IsotonicRegression::new_ascending(&pav_points);
+            // Try descending
+            let desc = IsotonicRegression::new_descending(&pav_points);
 
-            for (ix, part) in estimated_output_parts.iter().enumerate() {
-                let estimated_output_without_this = estimated_output - part;
-                let correction = actual_output - estimated_output_without_this;
-                let lr_correction = (correction * learning_rate) + (part * (1.0 - learning_rate));
-                point_vectors.write().unwrap()[ix]
-                    .push(Point::new(input_distances[ix], lr_correction));
-            }
-        });
-    point_vectors
+            let (best_reg, best_var) = match (asc, desc) {
+                (Ok(a), Ok(d)) => {
+                    let var_a = variance_explained(&a, points, f, ss_tot);
+                    let var_d = variance_explained(&d, points, f, ss_tot);
+                    if var_a >= var_d {
+                        (a, var_a)
+                    } else {
+                        (d, var_d)
+                    }
+                }
+                (Ok(a), Err(_)) => {
+                    let var_a = variance_explained(&a, points, f, ss_tot);
+                    (a, var_a)
+                }
+                (Err(_), Ok(d)) => {
+                    let var_d = variance_explained(&d, points, f, ss_tot);
+                    (d, var_d)
+                }
+                (Err(_), Err(_)) => {
+                    // Fallback: trivial regression
+                    let trivial = IsotonicRegression::new_ascending(&[
+                        PavPoint::new(0.0, mean_y),
+                        PavPoint::new(1.0, mean_y),
+                    ])
+                    .expect("trivial regression should never fail");
+                    (trivial, 0.0)
+                }
+            };
+
+            effect_regressions.push(best_reg);
+            variances_explained.push(best_var.max(0.0));
+        }
+
+        // Compute weights: proportion of variance explained, normalized.
+        let total_var: f64 = variances_explained.iter().sum();
+        let weights = if total_var > 0.0 {
+            variances_explained.iter().map(|v| v / total_var).collect()
+        } else {
+            // All features equally uninformative — equal weights
+            vec![1.0 / num_features as f64; num_features]
+        };
+
+        LearnedMetric {
+            effect_regressions,
+            weights,
+        }
+    }
+
+    /// Compute distance between two points using the learned metric.
+    ///
+    /// Transforms each feature value through its effect regression, then computes
+    /// a weighted Manhattan distance in effect space.
+    ///
+    /// `features_a` and `features_b` are the raw feature values (not distances).
+    pub fn distance(&self, features_a: &[f64], features_b: &[f64]) -> f64 {
+        if self.effect_regressions.is_empty() {
+            return f64::NAN;
+        }
+
+        self.effect_regressions
+            .iter()
+            .zip(self.weights.iter())
+            .enumerate()
+            .map(|(i, (reg, &w))| {
+                let effect_a = reg.interpolate(features_a[i]).unwrap_or(0.0);
+                let effect_b = reg.interpolate(features_b[i]).unwrap_or(0.0);
+                w * (effect_a - effect_b).abs()
+            })
+            .sum()
+    }
+
+    /// Number of features this metric was trained on.
+    pub fn num_features(&self) -> usize {
+        self.effect_regressions.len()
+    }
+
+    /// Get the learned weight for each feature (for diagnostics).
+    pub fn weights(&self) -> &[f64] {
+        &self.weights
+    }
 }
 
-fn refine_regressions(
-    distance_samples: &[(Vec<f64>, f64)],
-    regressions: &mut RwLock<Vec<IsotonicRegression>>,
-    learning_rate: f64,
-) {
-    let _span = span!(
-        Level::INFO,
-        "refine_regressions",
-        distance_samples.len = distance_samples.len(),
-        regressions.len = regressions.read().unwrap().len(),
-    )
-    .entered();
-    let lock = calculate_point_vectors(distance_samples, regressions, learning_rate);
-    let point_vectors = lock.read().unwrap();
-    let refined_regressions: Vec<IsotonicRegression> = point_vectors
-        .par_iter()
-        .progress()
-        .map(|points| -> IsotonicRegression { IsotonicRegression::new_ascending(points) })
-        .collect();
-
-    let mut writable_regressions = regressions.write().unwrap();
-    *writable_regressions = refined_regressions;
-}
-
-fn test_regressions(
-    distance_samples: &[(Vec<f64>, f64)],
-    regressions: &RwLock<Vec<IsotonicRegression>>,
+/// Compute fraction of output variance explained by this feature's isotonic regression.
+fn variance_explained(
+    reg: &IsotonicRegression<f64>,
+    points: &[TrainingPoint],
+    feature_idx: usize,
+    ss_tot: f64,
 ) -> f64 {
-    info!("test_regressions");
-    let reg = regressions.read().unwrap();
-    let sum_error_squared: f64 = distance_samples
-        .par_iter()
-        .progress()
-        .map(|(input_distances, output_distance)| {
-            let prediction = input_distances
-                .iter()
-                .enumerate()
-                .map(|(ix, input_dist)| reg[ix].interpolate(input_dist))
-                .sum::<f64>();
-            let error = prediction - output_distance;
-            error * error
+    if ss_tot == 0.0 {
+        return 0.0;
+    }
+    let ss_res: f64 = points
+        .iter()
+        .map(|p| {
+            let predicted = reg.interpolate(p.features[feature_idx]).unwrap_or(0.0);
+            (p.output - predicted).powi(2)
         })
         .sum();
-    (sum_error_squared / distance_samples.len() as f64).sqrt()
+    1.0 - ss_res / ss_tot
 }
 
 #[cfg(test)]
 mod tests {
-    use rand::{thread_rng, Rng};
-
-    use crate::metric::*;
+    use super::*;
 
     #[test]
-    fn split_train_test_test() {
-        let mut rng = SmallRng::from_entropy();
-        let data = gen_simple_data(&mut rng);
-        let (train, test): (Vec<(f64, f64)>, Vec<(f64, f64)>) =
-            split_train_test(&mut rng, 0.5, &data);
-        assert!((20..70).contains(&train.len()));
-        assert!((20..70).contains(&test.len()));
-        assert!(train.len() + test.len() == 100);
+    fn signal_feature_gets_higher_weight_than_noise() {
+        // Feature 0: perfectly predicts output (y = f0)
+        // Feature 1: random noise
+        let points: Vec<TrainingPoint> = (0..100)
+            .map(|i| {
+                let f0 = i as f64 / 100.0;
+                let f1 = ((i * 37) % 100) as f64 / 100.0;
+                TrainingPoint {
+                    features: vec![f0, f1],
+                    output: f0,
+                }
+            })
+            .collect();
+
+        let metric = LearnedMetric::learn(&points);
+
+        assert!(
+            metric.weights()[0] > metric.weights()[1] * 5.0,
+            "Signal feature should have much higher weight: w0={:.3}, w1={:.3}",
+            metric.weights()[0],
+            metric.weights()[1]
+        );
     }
 
     #[test]
-    fn sample_distances_test() {
-        let mut rng = SmallRng::from_entropy();
-        let data = gen_simple_data(&mut rng);
+    fn equal_additive_features_get_similar_weights() {
+        // y = f0 + f1 + f2, all features equally predictive
+        let points: Vec<TrainingPoint> = (0..200)
+            .map(|i| {
+                let f0 = (i % 10) as f64 / 10.0;
+                let f1 = ((i / 10) % 10) as f64 / 10.0;
+                let f2 = ((i * 7) % 10) as f64 / 10.0;
+                TrainingPoint {
+                    features: vec![f0, f1, f2],
+                    output: f0 + f1 + f2,
+                }
+            })
+            .collect();
 
-        let samples = sample_distances(
-            &mut rng,
-            &data,
-            float_input_metric,
-            float_output_metric,
-            100,
+        let metric = LearnedMetric::learn(&points);
+
+        eprintln!(
+            "Equal additive weights: [{:.3}, {:.3}, {:.3}]",
+            metric.weights()[0],
+            metric.weights()[1],
+            metric.weights()[2]
         );
 
-        assert_eq!(samples.len(), 100);
-        for sample in samples {
-            assert_eq!(sample.0[0], sample.1);
-        }
+        // All weights should be roughly equal (within 3x)
+        let max_w = metric.weights().iter().cloned().fold(0.0f64, f64::max);
+        let min_w = metric.weights().iter().cloned().fold(1.0f64, f64::min);
+        assert!(
+            max_w < min_w * 3.0,
+            "Weights should be roughly equal: {:?}",
+            metric.weights()
+        );
     }
 
     #[test]
-    fn create_initial_regressions_test() {
-        let mut rng = SmallRng::from_entropy();
-        let data = gen_simple_data(&mut rng);
+    fn noise_features_get_near_zero_weight() {
+        // y = f0, features 1-4 are noise
+        let points: Vec<TrainingPoint> = (0..100)
+            .map(|i| {
+                let f0 = i as f64 / 100.0;
+                TrainingPoint {
+                    features: vec![
+                        f0,
+                        ((i * 37) % 100) as f64 / 100.0,
+                        ((i * 53) % 100) as f64 / 100.0,
+                        ((i * 71) % 100) as f64 / 100.0,
+                        ((i * 89) % 100) as f64 / 100.0,
+                    ],
+                    output: f0,
+                }
+            })
+            .collect();
 
-        let samples = sample_distances(
-            &mut rng,
-            &data,
-            float_input_metric,
-            float_output_metric,
-            100,
+        let metric = LearnedMetric::learn(&points);
+
+        eprintln!("1 signal + 4 noise weights: {:?}", metric.weights());
+
+        // Feature 0 should dominate
+        assert!(
+            metric.weights()[0] > 0.5,
+            "Signal feature should have >50% weight, got {:.3}",
+            metric.weights()[0]
         );
-        let initial_regressions = create_initial_regressions(&samples);
-        assert_eq!(initial_regressions.len(), 1);
-
-        for point in initial_regressions[0].get_points() {
-            // Verify that input and output distances are the same
-            assert_eq!(point.x(), point.y());
-        }
-    }
-
-    fn float_input_metric(a: &f64, b: &f64) -> Vec<f64> {
-        vec![(a - b).abs()]
-    }
-
-    fn float_output_metric(a: &f64, b: &f64) -> f64 {
-        (a - b).abs()
-    }
-
-    fn gen_simple_data(rng: &mut SmallRng) -> Vec<(f64, f64)> {
-        let mut data: Vec<(f64, f64)> = vec![];
-        for _ in 0..100 {
-            let v = rng.gen_range(0.0..1.0);
-            data.push((v, v));
-        }
-        data
     }
 }
