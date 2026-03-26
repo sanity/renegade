@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 380" font-family="system-ui, -apple-system, sans-serif">
+  <defs>
+    <style>
+      text { font-size: 12px; fill: #c9d1d9; }
+      .title { font-size: 15px; font-weight: 600; fill: #c9d1d9; }
+      .subtitle { font-size: 11px; fill: #8b949e; }
+      .label { font-size: 11px; fill: #8b949e; }
+      .value { font-size: 11px; font-weight: 600; }
+      .bar-renegade { fill: #3fb950; }
+      .bar-sklearn { fill: #484f58; }
+      .winner { fill: #3fb950; }
+      .loser { fill: #c9d1d9; }
+      .neutral { fill: #8b949e; }
+      .axis { stroke: #30363d; stroke-width: 1; }
+      .grid { stroke: #21262d; stroke-width: 1; }
+    </style>
+  </defs>
+
+  <!-- Background -->
+  <rect width="720" height="380" rx="6" fill="#0d1117"/>
+
+  <!-- Title -->
+  <text x="360" y="28" text-anchor="middle" class="title">Renegade vs scikit-learn KNN — LOO Cross-Validation</text>
+  <text x="360" y="45" text-anchor="middle" class="subtitle">Renegade: zero configuration · sklearn: best scaler + tuned K</text>
+
+  <!-- Legend -->
+  <rect x="245" y="55" width="12" height="12" rx="2" class="bar-renegade"/>
+  <text x="262" y="65" class="label">Renegade</text>
+  <rect x="330" y="55" width="12" height="12" rx="2" class="bar-sklearn"/>
+  <text x="347" y="65" class="label">sklearn best</text>
+  <text x="430" y="65" class="label" style="font-style: italic;">Higher is better ↑</text>
+
+  <!-- Classification chart area: y=80 to y=260 -->
+  <!-- Scale: 80% to 100% -->
+  <text x="52" y="78" class="label" text-anchor="end">100%</text>
+  <line x1="56" y1="85" x2="520" y2="85" class="grid"/>
+  <text x="52" y="123" class="label" text-anchor="end">95%</text>
+  <line x1="56" y1="130" x2="520" y2="130" class="grid"/>
+  <text x="52" y="168" class="label" text-anchor="end">90%</text>
+  <line x1="56" y1="175" x2="520" y2="175" class="grid"/>
+  <text x="52" y="213" class="label" text-anchor="end">85%</text>
+  <line x1="56" y1="220" x2="520" y2="220" class="grid"/>
+  <text x="52" y="258" class="label" text-anchor="end">80%</text>
+  <line x1="56" y1="265" x2="520" y2="265" class="axis"/>
+
+  <!-- Iris: Renegade 94.0%, sklearn 96.7% -->
+  <!-- 80%=265, 100%=85. Each 1% = 9px. -->
+  <rect x="68" y="139" width="28" height="126" rx="2" class="bar-renegade"/>
+  <text x="82" y="134" text-anchor="middle" class="value loser">94.0</text>
+  <rect x="100" y="115" width="28" height="150" rx="2" class="bar-sklearn"/>
+  <text x="114" y="110" text-anchor="middle" class="value neutral">96.7</text>
+  <text x="98" y="282" text-anchor="middle" class="label">Iris</text>
+  <text x="98" y="294" text-anchor="middle" class="label">150×4</text>
+
+  <!-- Wine: Renegade 98.9%, sklearn 96.6% -->
+  <rect x="158" y="94" width="28" height="171" rx="2" class="bar-renegade"/>
+  <text x="172" y="89" text-anchor="middle" class="value winner">98.9</text>
+  <rect x="190" y="116" width="28" height="149" rx="2" class="bar-sklearn"/>
+  <text x="204" y="111" text-anchor="middle" class="value neutral">96.6</text>
+  <text x="188" y="282" text-anchor="middle" class="label">Wine</text>
+  <text x="188" y="294" text-anchor="middle" class="label">178×13</text>
+
+  <!-- Ionosphere: Renegade 98.6%, sklearn 91.2% -->
+  <rect x="248" y="97" width="28" height="168" rx="2" class="bar-renegade"/>
+  <text x="262" y="92" text-anchor="middle" class="value winner">98.6</text>
+  <rect x="280" y="166" width="28" height="99" rx="2" class="bar-sklearn"/>
+  <text x="294" y="161" text-anchor="middle" class="value neutral">91.2</text>
+  <text x="278" y="282" text-anchor="middle" class="label">Ionosphere</text>
+  <text x="278" y="294" text-anchor="middle" class="label">351×34</text>
+
+  <!-- Breast Cancer: Renegade 97.4%, sklearn 96.7% -->
+  <rect x="338" y="108" width="28" height="157" rx="2" class="bar-renegade"/>
+  <text x="352" y="103" text-anchor="middle" class="value winner">97.4</text>
+  <rect x="370" y="115" width="28" height="150" rx="2" class="bar-sklearn"/>
+  <text x="384" y="110" text-anchor="middle" class="value neutral">96.7</text>
+  <text x="368" y="282" text-anchor="middle" class="label">Breast Ca.</text>
+  <text x="368" y="294" text-anchor="middle" class="label">569×30</text>
+
+  <!-- RMSE section on the right -->
+  <line x1="540" y1="75" x2="540" y2="300" class="grid"/>
+  <text x="630" y="78" text-anchor="middle" class="label" style="font-style: italic;">Lower is better ↓</text>
+
+  <!-- Auto MPG: Renegade 2.78, sklearn 2.88 -->
+  <!-- Scale: 0 to 3.5 RMSE, chart area 85 to 265, so 1 RMSE = 51.4px -->
+  <text x="548" y="92" class="label">RMSE</text>
+  <line x1="568" y1="85" x2="710" y2="85" class="grid"/>
+  <text x="548" y="143" class="label">1.0</text>
+  <line x1="568" y1="136" x2="710" y2="136" class="grid"/>
+  <text x="548" y="195" class="label">2.0</text>
+  <line x1="568" y1="188" x2="710" y2="188" class="grid"/>
+  <text x="548" y="246" class="label">3.0</text>
+  <line x1="568" y1="239" x2="710" y2="239" class="grid"/>
+  <line x1="568" y1="265" x2="710" y2="265" class="axis"/>
+
+  <!-- Auto MPG: Renegade 2.78, sklearn 2.88. 0=85, 3.5=265 -->
+  <rect x="580" y="228" width="24" height="37" rx="2" class="bar-renegade"/>
+  <text x="592" y="223" text-anchor="middle" class="value winner">2.78</text>
+  <rect x="608" y="233" width="24" height="32" rx="2" class="bar-sklearn"/>
+  <text x="620" y="228" text-anchor="middle" class="value neutral">2.88</text>
+  <text x="607" y="282" text-anchor="middle" class="label">Auto MPG</text>
+  <text x="607" y="294" text-anchor="middle" class="label">393×7</text>
+
+  <!-- Wine Quality: Renegade 0.73, sklearn 0.74. -->
+  <rect x="656" y="123" width="24" height="142" rx="2" class="bar-renegade"/>
+  <text x="668" y="118" text-anchor="middle" class="value winner">0.73</text>
+  <rect x="684" y="123" width="24" height="142" rx="2" class="bar-sklearn"/>
+  <text x="696" y="118" text-anchor="middle" class="value neutral">0.74</text>
+  <text x="682" y="282" text-anchor="middle" class="label">Wine Qual.</text>
+  <text x="682" y="294" text-anchor="middle" class="label">4898×11</text>
+
+  <!-- Summary line -->
+  <text x="360" y="325" text-anchor="middle" class="subtitle">Renegade wins 5 of 6 datasets with zero configuration</text>
+  <text x="360" y="342" text-anchor="middle" class="subtitle">sklearn requires choosing a scaler, distance metric, and K for each dataset</text>
+
+  <!-- Performance callout -->
+  <rect x="130" y="355" width="460" height="20" rx="4" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="360" y="369" text-anchor="middle" class="label">⚡ 5µs inference · 85ms training @ 1k points · VP-tree indexed · zero parameters</text>
+</svg>
