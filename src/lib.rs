@@ -209,17 +209,43 @@ impl<P: DataPoint + Clone> Renegade<P> {
 
     /// Find the k nearest neighbors to a query point.
     /// Returns neighbors sorted by distance (closest first).
-    /// Uses VP-tree for fast search when available, otherwise brute force.
+    /// Uses VP-tree for indexed points, plus brute-force scan of any points
+    /// added since the tree was built.
     pub fn query_k(&self, query: &P, k: usize) -> Neighbors {
         let query_values = query.feature_values();
+        let n = self.len();
 
         let results = if let Some(ref vp) = self.vp_index {
-            // VP-tree path: O(log n) average
+            let vp_size = vp.len();
             let query_dist = |i: usize| self.distance_to_entry(&query_values, query, i);
-            vp.query_nearest(k, &query_dist)
+
+            // Search VP-tree for indexed points
+            let mut results = vp.query_nearest(k, &query_dist);
+
+            // Brute-force scan any points added after the tree was built
+            if vp_size < n {
+                for i in vp_size..n {
+                    let dist = self.distance_to_entry(&query_values, query, i);
+                    if results.len() < k {
+                        results.push((i, dist));
+                        results.sort_by(|a, b| {
+                            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    } else if let Some(worst) = results.last() {
+                        if dist < worst.1 {
+                            results.pop();
+                            results.push((i, dist));
+                            results.sort_by(|a, b| {
+                                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                        }
+                    }
+                }
+            }
+
+            results
         } else {
-            // Brute force path: O(n)
-            let n = self.len();
+            // No VP-tree: brute force all points
             let mut distances: Vec<(usize, f64)> = Vec::with_capacity(n);
             for i in 0..n {
                 let dist = self.distance_to_entry(&query_values, query, i);
