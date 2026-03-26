@@ -64,10 +64,12 @@ pub struct Renegade<P: DataPoint> {
     // --- Training state ---
     optimal_k: Option<usize>,
     learned_metric: Option<LearnedMetric>,
-    /// VP-tree index for fast queries on larger datasets.
+    /// VP-tree index for fast queries.
     vp_index: Option<vptree::VpTree>,
     /// Number of entries when optimal_k / metric were last computed.
     computed_at: usize,
+    /// Number of entries when the VP-tree was last built.
+    vp_built_at: usize,
 }
 
 /// Minimum number of data points before learning a metric.
@@ -88,6 +90,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
             learned_metric: None,
             vp_index: None,
             computed_at: 0,
+            vp_built_at: 0,
         }
     }
 
@@ -113,9 +116,21 @@ impl<P: DataPoint + Clone> Renegade<P> {
         self.outputs.push(output);
         self.points.push(point);
 
-        // Invalidate if dataset has doubled since last computation
-        if self.computed_at > 0 && self.len() >= self.computed_at * 2 {
-            self.invalidate();
+        // Invalidate metric/K if dataset has grown 50% since last training
+        if self.computed_at > 0 && self.len() >= self.computed_at + self.computed_at / 2 {
+            self.optimal_k = None;
+            self.learned_metric = None;
+            // VP-tree will be rebuilt during ensure_trained
+            self.vp_index = None;
+            self.vp_built_at = 0;
+        }
+
+        // Rebuild VP-tree (cheap) when unindexed tail exceeds 20% of indexed points
+        if self.vp_built_at > 0 {
+            let tail = self.len() - self.vp_built_at;
+            if tail > self.vp_built_at / 5 {
+                self.rebuild_vp_tree();
+            }
         }
     }
 
@@ -168,6 +183,18 @@ impl<P: DataPoint + Clone> Renegade<P> {
         self.optimal_k = None;
         self.learned_metric = None;
         self.vp_index = None;
+        self.vp_built_at = 0;
+    }
+
+    /// Rebuild just the VP-tree (cheap) without retraining metric/K.
+    fn rebuild_vp_tree(&mut self) {
+        let n = self.len();
+        if n >= VP_TREE_THRESHOLD {
+            self.vp_index = Some(vptree::VpTree::build(n, &|a, b| {
+                self.distance_between(a, b)
+            }));
+            self.vp_built_at = n;
+        }
     }
 
     /// Get the cached feature values for entry i as a slice.
@@ -216,15 +243,14 @@ impl<P: DataPoint + Clone> Renegade<P> {
         let n = self.len();
 
         let results = if let Some(ref vp) = self.vp_index {
-            let vp_size = vp.len();
             let query_dist = |i: usize| self.distance_to_entry(&query_values, query, i);
 
             // Search VP-tree for indexed points
             let mut results = vp.query_nearest(k, &query_dist);
 
             // Brute-force scan any points added after the tree was built
-            if vp_size < n {
-                for i in vp_size..n {
+            if self.vp_built_at < n {
+                for i in self.vp_built_at..n {
                     let dist = self.distance_to_entry(&query_values, query, i);
                     if results.len() < k {
                         results.push((i, dist));
@@ -333,13 +359,8 @@ impl<P: DataPoint + Clone> Renegade<P> {
             self.optimal_k = Some(k);
         }
 
-        // Build VP-tree index for fast queries on larger datasets
-        if self.len() >= VP_TREE_THRESHOLD {
-            let n = self.len();
-            self.vp_index = Some(vptree::VpTree::build(n, &|a, b| {
-                self.distance_between(a, b)
-            }));
-        }
+        // Build VP-tree index for fast queries
+        self.rebuild_vp_tree();
 
         self.computed_at = self.len();
     }
