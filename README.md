@@ -96,7 +96,7 @@ Renegade wins 5 of 6 datasets with zero configuration vs sklearn requiring choic
 
 - **No hyperparameters** — every configuration option is an opportunity for misconfiguration
 - **No multivariate optimization** — no gradient descent, no learning rates, no convergence concerns
-- **Brute-force search** — designed for up to ~100k data points. For larger datasets, consider a data retention strategy (sliding window, exponential decay)
+- **Automatic indexing** — brute force for small datasets (< 1k points), VP-tree for larger ones. Scales to 100k+ points with ~50µs queries
 - **Training cost is amortized** — metric learning and K selection only recompute when the dataset has doubled in size
 
 ## Intended Use Cases
