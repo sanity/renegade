@@ -115,7 +115,7 @@ let pred = model.predict_with_diagnostics(&query, k);
 
 ## Intended Use Cases
 
-- **Routing decisions** based on historical peer performance (the original motivation — [Freenet](https://freenet.org))
+- **Routing decisions** based on historical peer performance (e.g., peer selection in [Freenet](https://freenet.org))
 - **Online learning** with moderate data volumes
 - **Mixed-type data** where features are numeric, categorical, or custom
 - **Low-data regimes** where parametric models overfit
