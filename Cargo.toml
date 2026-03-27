@@ -1,6 +1,6 @@
 [package]
 name = "renegade-ml"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Zero-config nonparametric supervised learning — KNN with auto-tuned K, metric learning, and VP-tree indexing"
 license = "AGPL-3.0-or-later"
