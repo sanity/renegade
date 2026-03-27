@@ -384,4 +384,25 @@ fn classification_does_not_get_bandwidth() {
         "Classification should not get Gaussian bandwidth, got {:?}",
         diag.kernel_bandwidth
     );
+    assert!(diag.is_classification);
+}
+
+#[test]
+fn integer_regression_not_misdetected_as_classification() {
+    // Many distinct integer values relative to dataset size = regression, not classification.
+    // e.g., ratings 1-20 with 50 data points.
+    let range = (0.0, 50.0);
+    let mut model = Renegade::new();
+    for i in 0..50 {
+        // Output is i % 20 — 20 distinct integer values out of 50 points
+        // sqrt(50) ≈ 7, so 20 > 7 → should be detected as regression
+        model.add(Point2D::new(i as f64, 0.0, range, range), (i % 20) as f64);
+    }
+
+    let _ = model.predict(&Point2D::new(25.0, 0.0, range, range));
+    let diag = model.diagnostics();
+    assert!(
+        !diag.is_classification,
+        "20 distinct integer values out of 50 points should be regression, not classification"
+    );
 }

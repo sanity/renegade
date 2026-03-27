@@ -492,42 +492,57 @@ impl<P: DataPoint + Clone> Renegade<P> {
 
         for &(i, ref distances) in &eval_data {
             if is_classification {
-                let mut counts: Vec<(f64, usize)> = Vec::new();
+                // Weighted class voting — matches class_votes() behavior
+                let mut votes: Vec<(f64, f64)> = Vec::new(); // (class, total_weight)
                 for k in 1..=max_k.min(distances.len()) {
-                    let (j, _) = distances[k - 1];
+                    let (j, dist) = distances[k - 1];
                     let val = self.outputs[j];
-                    if let Some(entry) = counts.iter_mut().find(|(v, _)| (*v - val).abs() < 1e-10) {
-                        entry.1 += 1;
+                    let w = if dist == 0.0 {
+                        self.instance_weights[j] * 1e6
                     } else {
-                        counts.push((val, 1));
+                        self.instance_weights[j] / dist
+                    };
+                    if let Some(entry) = votes.iter_mut().find(|(v, _)| (*v - val).abs() < 1e-10) {
+                        entry.1 += w;
+                    } else {
+                        votes.push((val, w));
                     }
-                    let predicted = counts.iter().max_by_key(|(_, c)| *c).unwrap().0;
+                    let predicted = votes
+                        .iter()
+                        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .unwrap()
+                        .0;
                     if (predicted - self.outputs[i]).abs() > 0.5 {
                         errors_by_k[k] += 1.0;
                     }
                 }
             } else {
+                // Inverse-distance weighting with instance weights — matches weighted_mean()
                 let mut weight_sum = 0.0;
                 let mut value_sum = 0.0;
+                let mut exact_w = 0.0;
+                let mut exact_v = 0.0;
                 let mut has_exact = false;
-                let mut exact_val = 0.0;
 
                 for k in 1..=max_k.min(distances.len()) {
                     let (j, dist) = distances[k - 1];
 
-                    if !has_exact {
-                        if dist == 0.0 {
-                            has_exact = true;
-                            exact_val = self.outputs[j];
-                        } else {
-                            let w = 1.0 / dist;
-                            weight_sum += w;
-                            value_sum += w * self.outputs[j];
-                        }
+                    if dist == 0.0 {
+                        has_exact = true;
+                        exact_w += self.instance_weights[j];
+                        exact_v += self.instance_weights[j] * self.outputs[j];
+                    } else if !has_exact {
+                        let w = self.instance_weights[j] / dist;
+                        weight_sum += w;
+                        value_sum += w * self.outputs[j];
                     }
 
                     let predicted = if has_exact {
-                        exact_val
+                        if exact_w > 0.0 {
+                            exact_v / exact_w
+                        } else {
+                            self.outputs[j]
+                        }
                     } else if weight_sum > 0.0 {
                         value_sum / weight_sum
                     } else {
@@ -630,6 +645,10 @@ impl<P: DataPoint + Clone> Renegade<P> {
     }
 
     /// Detect whether this is a classification or regression problem.
+    /// Heuristic: all integer outputs, ≤20 distinct values, AND the ratio of
+    /// distinct values to dataset size is low enough to look categorical.
+    /// This avoids misfiring on integer-valued regression targets like
+    /// ratings (1-5), counts, or ages.
     fn detect_classification(&self) -> bool {
         if self.is_empty() {
             return false;
@@ -652,7 +671,20 @@ impl<P: DataPoint + Clone> Renegade<P> {
             }
         }
 
-        true
+        let n = self.len();
+        let n_distinct = distinct.len();
+
+        // With very few data points, can't reliably distinguish — default to regression
+        // unless there are clearly only 2-3 classes.
+        if n < 10 {
+            return n_distinct <= 3;
+        }
+
+        // For larger datasets: if distinct values are a large fraction of the data,
+        // it's more likely integer regression (e.g., 50 distinct values out of 200 points).
+        // Classification datasets typically have n_distinct << sqrt(n).
+        let max_classes = (n as f64).sqrt().ceil() as usize;
+        n_distinct <= max_classes.min(20)
     }
 }
 

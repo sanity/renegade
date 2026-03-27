@@ -121,10 +121,35 @@ impl<P: DataPoint + Clone> Renegade<P> {
             })
             .collect();
 
-        // Compute weighted mean prediction
+        // Compute prediction using the same method as predict()
         let prediction = if neighbors.is_empty() {
             f64::NAN
+        } else if let Some(h) = self.kernel_bandwidth {
+            // Gaussian kernel — matches predict() behavior
+            let h2 = 2.0 * h * h;
+            let exact: Vec<&NeighborDetail> =
+                neighbors.iter().filter(|n| n.distance == 0.0).collect();
+            if !exact.is_empty() {
+                exact[0].output
+            } else {
+                let mut ws = 0.0;
+                let mut vs = 0.0;
+                for n in &neighbors {
+                    let w = (-n.distance * n.distance / h2).exp();
+                    if w < 1e-15 {
+                        break;
+                    }
+                    ws += w;
+                    vs += w * n.output;
+                }
+                if ws > 0.0 {
+                    vs / ws
+                } else {
+                    neighbors[0].output
+                }
+            }
         } else {
+            // Hard-k + inverse-distance
             let mut exact = None;
             let mut ws = 0.0;
             let mut vs = 0.0;
