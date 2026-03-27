@@ -10,6 +10,8 @@ pub struct ModelDiagnostics {
     pub optimal_k: Option<usize>,
     /// Whether the learned metric is active (vs baseline Gower distance).
     pub metric_active: bool,
+    /// Gaussian kernel bandwidth (None = using hard-k + 1/d weighting).
+    pub kernel_bandwidth: Option<f64>,
     /// Number of entries when the model was last trained.
     pub trained_at: usize,
     /// Number of entries added since last training.
@@ -81,6 +83,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
             num_entries: self.len(),
             optimal_k: self.optimal_k,
             metric_active: self.learned_metric.is_some(),
+            kernel_bandwidth: self.kernel_bandwidth,
             trained_at: self.computed_at,
             entries_since_training: self.len().saturating_sub(self.computed_at),
             is_classification,

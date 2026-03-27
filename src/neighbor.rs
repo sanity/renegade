@@ -51,6 +51,49 @@ impl Neighbors {
         value_sum / weight_sum
     }
 
+    /// Gaussian kernel weighted average: w(d) = instance_weight * exp(-d²/(2h²)).
+    /// Unlike hard-k + 1/d, this gives smooth decay — distant neighbors contribute
+    /// proportionally less without a sharp cutoff.
+    pub fn gaussian_weighted_mean(&self, bandwidth: f64) -> f64 {
+        if self.neighbors.is_empty() {
+            return f64::NAN;
+        }
+
+        // Exact matches: same handling as weighted_mean
+        let exact: Vec<&Neighbor> = self
+            .neighbors
+            .iter()
+            .filter(|n| n.distance == 0.0)
+            .collect();
+        if !exact.is_empty() {
+            let total_w: f64 = exact.iter().map(|n| n.weight).sum();
+            if total_w > 0.0 {
+                return exact.iter().map(|n| n.weight * n.output).sum::<f64>() / total_w;
+            }
+            return exact[0].output;
+        }
+
+        let h2 = 2.0 * bandwidth * bandwidth;
+        let mut weight_sum = 0.0;
+        let mut value_sum = 0.0;
+        for n in &self.neighbors {
+            let w = (-n.distance * n.distance / h2).exp() * n.weight;
+            if w < 1e-15 {
+                // Beyond ~6 sigma, negligible contribution — stop early
+                // since neighbors are sorted by distance
+                break;
+            }
+            weight_sum += w;
+            value_sum += w * n.output;
+        }
+        if weight_sum > 0.0 {
+            value_sum / weight_sum
+        } else {
+            // Bandwidth too small for any neighbor to contribute — fall back to nearest
+            self.neighbors[0].output
+        }
+    }
+
     /// Extrapolate output to distance=0 by fitting a linear trend.
     pub fn extrapolate(&self) -> ExtrapolatedPrediction {
         ExtrapolatedPrediction::from_neighbors(&self.neighbors)

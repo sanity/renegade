@@ -66,6 +66,9 @@ pub struct Renegade<P: DataPoint> {
     // --- Training state ---
     optimal_k: Option<usize>,
     learned_metric: Option<LearnedMetric>,
+    /// Gaussian kernel bandwidth for regression. When set, predict() uses
+    /// Gaussian-weighted mean over max_k neighbors instead of hard-k + 1/d.
+    kernel_bandwidth: Option<f64>,
     /// VP-tree index for fast queries.
     vp_index: Option<vptree::VpTree>,
     /// Number of entries when optimal_k / metric were last computed.
@@ -91,6 +94,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
             num_features: 0,
             optimal_k: None,
             learned_metric: None,
+            kernel_bandwidth: None,
             vp_index: None,
             computed_at: 0,
             vp_built_at: 0,
@@ -131,6 +135,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
         if self.computed_at > 0 && self.len() >= self.computed_at + self.computed_at / 2 {
             self.optimal_k = None;
             self.learned_metric = None;
+            self.kernel_bandwidth = None;
             self.vp_index = None;
             self.vp_built_at = 0;
         }
@@ -194,6 +199,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
     fn invalidate(&mut self) {
         self.optimal_k = None;
         self.learned_metric = None;
+        self.kernel_bandwidth = None;
         self.vp_index = None;
         self.vp_built_at = 0;
     }
@@ -315,9 +321,22 @@ impl<P: DataPoint + Clone> Renegade<P> {
     }
 
     /// Predict output using automatically determined K and weighted mean.
+    /// For regression, may use Gaussian kernel weighting if it was selected
+    /// during training as superior to hard-k + inverse-distance.
     pub fn predict(&mut self, query: &P) -> f64 {
-        let neighbors = self.query(query);
-        neighbors.weighted_mean()
+        self.ensure_trained();
+        let k = self.optimal_k.unwrap();
+        if let Some(h) = self.kernel_bandwidth {
+            // Gaussian kernel: query max_k neighbors so the kernel has a full
+            // neighborhood to weight. The kernel itself does the "soft cutoff" —
+            // distant neighbors contribute exponentially less.
+            let max_k = (self.len() as f64).sqrt().ceil() as usize;
+            let neighbors = self.query_k(query, max_k);
+            neighbors.gaussian_weighted_mean(h)
+        } else {
+            let neighbors = self.query_k(query, k);
+            neighbors.weighted_mean()
+        }
     }
 
     /// Predict output using distance-trend extrapolation (auto K).
@@ -341,30 +360,53 @@ impl<P: DataPoint + Clone> Renegade<P> {
     /// Ensure the metric and K are trained. Recomputes if needed.
     /// Learns the metric, then compares LOO error with and without it.
     /// Only keeps the metric if it actually improves predictions.
+    /// For regression, also evaluates Gaussian kernel weighting and uses it
+    /// if it outperforms hard-k + inverse-distance.
     fn ensure_trained(&mut self) {
         if self.optimal_k.is_some() {
             return;
         }
 
         if self.len() >= MIN_POINTS_FOR_METRIC {
-            // Compute best K without metric
+            // Compute best K (and bandwidth for regression) without metric.
             self.learned_metric = None;
-            let k_no_metric = self.compute_optimal_k();
-            let is_classification = self.detect_classification();
-            let error_no_metric = self.loo_error_for_k(k_no_metric, is_classification);
+            let (k_no_metric, error_no_metric, bw_no_metric) =
+                self.compute_optimal_k_and_bandwidth();
 
-            // Learn metric and compute best K with it
+            // Learn metric and compute best K (and bandwidth) with it
             let candidate_metric = self.learn_metric();
             self.learned_metric = Some(candidate_metric);
-            let k_with_metric = self.compute_optimal_k();
-            let error_with_metric = self.loo_error_for_k(k_with_metric, is_classification);
+            let (k_with_metric, error_with_metric, bw_with_metric) =
+                self.compute_optimal_k_and_bandwidth();
 
-            // Only keep metric if it strictly improves LOO error.
-            if error_with_metric < error_no_metric {
+            // Pick the globally best configuration across all 4 combinations:
+            // {no-metric, metric} × {hard-k, gaussian}
+            let best_no_metric = match bw_no_metric {
+                Some((_, bw_err)) if bw_err < error_no_metric => bw_err,
+                _ => error_no_metric,
+            };
+            let best_with_metric = match bw_with_metric {
+                Some((_, bw_err)) if bw_err < error_with_metric => bw_err,
+                _ => error_with_metric,
+            };
+
+            if best_with_metric < best_no_metric {
+                // Keep metric
                 self.optimal_k = Some(k_with_metric);
+                if let Some((h, bw_err)) = bw_with_metric {
+                    if bw_err < error_with_metric {
+                        self.kernel_bandwidth = Some(h);
+                    }
+                }
             } else {
+                // No metric
                 self.learned_metric = None;
                 self.optimal_k = Some(k_no_metric);
+                if let Some((h, bw_err)) = bw_no_metric {
+                    if bw_err < error_no_metric {
+                        self.kernel_bandwidth = Some(h);
+                    }
+                }
             }
         } else {
             self.learned_metric = None;
@@ -401,10 +443,19 @@ impl<P: DataPoint + Clone> Renegade<P> {
     /// Compute optimal K via leave-one-out cross-validation.
     /// Computes distances once per eval point, then evaluates all K values
     /// from the sorted distance list.
+    /// For regression, also sweeps Gaussian bandwidth candidates in the same
+    /// pass (zero extra distance computations).
+    /// Returns (best_k, Option<(bandwidth, bandwidth_error)>).
     fn compute_optimal_k(&self) -> usize {
+        self.compute_optimal_k_and_bandwidth().0
+    }
+
+    /// Joint optimization of k and bandwidth. Returns:
+    /// (best_k, best_k_mse, Option<(best_bandwidth, best_bandwidth_mse)>)
+    fn compute_optimal_k_and_bandwidth(&self) -> (usize, f64, Option<(f64, f64)>) {
         let n = self.len();
         if n <= 2 {
-            return n.max(1);
+            return (n.max(1), f64::MAX, None);
         }
 
         let max_k = (n as f64).sqrt().ceil() as usize;
@@ -415,17 +466,31 @@ impl<P: DataPoint + Clone> Renegade<P> {
         let max_eval = 200.min(n);
         let step = if n > max_eval { n / max_eval } else { 1 };
 
+        // Collect sorted distances for each eval point (shared by k and bandwidth sweeps)
+        let eval_data: Vec<(usize, Vec<(usize, f64)>)> = (0..n)
+            .step_by(step)
+            .take(max_eval)
+            .map(|i| {
+                let mut distances: Vec<(usize, f64)> = (0..n)
+                    .filter(|&j| j != i)
+                    .map(|j| (j, self.distance_between(i, j)))
+                    .collect();
+                distances
+                    .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                distances.truncate(max_k);
+                (i, distances)
+            })
+            .collect();
+
+        let count = eval_data.len();
+        if count == 0 {
+            return (1, f64::MAX, None);
+        }
+
+        // Sweep k values
         let mut errors_by_k = vec![0.0f64; max_k + 1];
-        let mut count = 0;
 
-        for i in (0..n).step_by(step).take(max_eval) {
-            let mut distances: Vec<(usize, f64)> = (0..n)
-                .filter(|&j| j != i)
-                .map(|j| (j, self.distance_between(i, j)))
-                .collect();
-
-            distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
+        for &(i, ref distances) in &eval_data {
             if is_classification {
                 let mut counts: Vec<(f64, usize)> = Vec::new();
                 for k in 1..=max_k.min(distances.len()) {
@@ -473,24 +538,95 @@ impl<P: DataPoint + Clone> Renegade<P> {
                     errors_by_k[k] += err * err;
                 }
             }
-            count += 1;
-        }
-
-        if count == 0 {
-            return 1;
         }
 
         let mut best_k = 1;
-        let mut best_error = f64::MAX;
+        let mut best_k_error = f64::MAX;
         for (k, &err) in errors_by_k.iter().enumerate().skip(1) {
             let error = err / count as f64;
-            if error < best_error {
-                best_error = error;
+            if error < best_k_error {
+                best_k_error = error;
                 best_k = k;
             }
         }
 
-        best_k
+        // For regression, also sweep Gaussian bandwidth candidates (no extra distance computation)
+        let bandwidth_result = if !is_classification {
+            // Build bandwidth candidates from distance percentiles
+            let mut all_dists: Vec<f64> = Vec::new();
+            for (_, distances) in &eval_data {
+                for &(_, d) in distances {
+                    if d > 0.0 {
+                        all_dists.push(d);
+                    }
+                }
+            }
+
+            if all_dists.is_empty() {
+                None
+            } else {
+                all_dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let h_candidates: Vec<f64> = (1..=20)
+                    .map(|t| {
+                        let pct = t as f64 / 21.0;
+                        let idx = (pct * all_dists.len() as f64) as usize;
+                        all_dists[idx.min(all_dists.len() - 1)]
+                    })
+                    .collect();
+
+                let mut best_h = h_candidates[0];
+                let mut best_h_error = f64::MAX;
+
+                for &h in &h_candidates {
+                    let h2 = 2.0 * h * h;
+                    let mut total_error = 0.0;
+
+                    for &(i, ref distances) in &eval_data {
+                        let mut weight_sum = 0.0;
+                        let mut value_sum = 0.0;
+                        let mut exact_match = None;
+
+                        for &(j, dist) in distances {
+                            if dist == 0.0 {
+                                exact_match = Some(self.outputs[j]);
+                                break;
+                            }
+                            let w = (-dist * dist / h2).exp() * self.instance_weights[j];
+                            if w < 1e-15 {
+                                break;
+                            }
+                            weight_sum += w;
+                            value_sum += w * self.outputs[j];
+                        }
+
+                        let predicted = if let Some(v) = exact_match {
+                            v
+                        } else if weight_sum > 0.0 {
+                            value_sum / weight_sum
+                        } else if let Some(&(j, _)) = distances.first() {
+                            self.outputs[j]
+                        } else {
+                            continue;
+                        };
+
+                        let err = predicted - self.outputs[i];
+                        total_error += err * err;
+                    }
+
+                    let avg_error = total_error / count as f64;
+                    if avg_error < best_h_error {
+                        best_h_error = avg_error;
+                        best_h = h;
+                    }
+                }
+
+                Some((best_h, best_h_error))
+            }
+        } else {
+            None
+        };
+
+        (best_k, best_k_error, bandwidth_result)
     }
 
     /// Detect whether this is a classification or regression problem.
@@ -517,63 +653,6 @@ impl<P: DataPoint + Clone> Renegade<P> {
         }
 
         true
-    }
-
-    /// Compute leave-one-out error for a given K.
-    fn loo_error_for_k(&self, k: usize, is_classification: bool) -> f64 {
-        let n = self.len();
-        let max_eval = 200.min(n);
-        let step = if n > max_eval { n / max_eval } else { 1 };
-        let mut total_error = 0.0;
-        let mut count = 0;
-
-        for i in (0..n).step_by(step).take(max_eval) {
-            let mut distances: Vec<(usize, f64)> = (0..n)
-                .filter(|&j| j != i)
-                .map(|j| (j, self.distance_between(i, j)))
-                .collect();
-
-            distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            distances.truncate(k);
-
-            if is_classification {
-                let mut counts: Vec<(f64, usize)> = Vec::new();
-                for &(j, _) in &distances {
-                    let val = self.outputs[j];
-                    if let Some(entry) = counts.iter_mut().find(|(v, _)| (*v - val).abs() < 1e-10) {
-                        entry.1 += 1;
-                    } else {
-                        counts.push((val, 1));
-                    }
-                }
-                let predicted = counts.iter().max_by_key(|(_, count)| *count).unwrap().0;
-                if (predicted - self.outputs[i]).abs() > 0.5 {
-                    total_error += 1.0;
-                }
-            } else {
-                let mut weight_sum = 0.0;
-                let mut value_sum = 0.0;
-                let mut exact_match = None;
-                for &(j, dist) in &distances {
-                    if dist == 0.0 {
-                        exact_match = Some(self.outputs[j]);
-                        break;
-                    }
-                    let w = 1.0 / dist;
-                    weight_sum += w;
-                    value_sum += w * self.outputs[j];
-                }
-                let predicted = exact_match.unwrap_or(value_sum / weight_sum);
-                let err = predicted - self.outputs[i];
-                total_error += err * err;
-            }
-            count += 1;
-        }
-
-        if count == 0 {
-            return f64::MAX;
-        }
-        total_error / count as f64
     }
 }
 

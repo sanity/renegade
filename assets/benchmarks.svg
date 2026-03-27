@@ -80,7 +80,7 @@
   <line x1="540" y1="75" x2="540" y2="300" class="grid"/>
   <text x="630" y="78" text-anchor="middle" class="label" style="font-style: italic;">Lower is better ↓</text>
 
-  <!-- Auto MPG: Renegade 2.78, sklearn 2.88 -->
+  <!-- Auto MPG: Renegade 2.56, sklearn 2.88 -->
   <!-- Scale: 0 to 3.5 RMSE, chart area 85 to 265, so 1 RMSE = 51.4px -->
   <text x="548" y="92" class="label">RMSE</text>
   <line x1="568" y1="85" x2="710" y2="85" class="grid"/>
@@ -92,9 +92,9 @@
   <line x1="568" y1="239" x2="710" y2="239" class="grid"/>
   <line x1="568" y1="265" x2="710" y2="265" class="axis"/>
 
-  <!-- Auto MPG: Renegade 2.78, sklearn 2.88. 0=85, 3.5=265 -->
-  <rect x="580" y="228" width="24" height="37" rx="2" class="bar-renegade"/>
-  <text x="592" y="223" text-anchor="middle" class="value winner">2.78</text>
+  <!-- Auto MPG: Renegade 2.56, sklearn 2.88. 0=85, 3.5=265. 1 RMSE ≈ 51.4px -->
+  <rect x="580" y="217" width="24" height="48" rx="2" class="bar-renegade"/>
+  <text x="592" y="212" text-anchor="middle" class="value winner">2.56</text>
   <rect x="608" y="233" width="24" height="32" rx="2" class="bar-sklearn"/>
   <text x="620" y="228" text-anchor="middle" class="value neutral">2.88</text>
   <text x="607" y="282" text-anchor="middle" class="label">Auto MPG</text>

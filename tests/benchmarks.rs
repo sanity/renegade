@@ -390,33 +390,6 @@ fn loo_auto_classification_accuracy<P: DataPoint + Clone>(data: &[(P, f64)]) -> 
     (correct as f64 / n as f64, k)
 }
 
-fn loo_auto_regression_rmse<P: DataPoint + Clone>(data: &[(P, f64)]) -> (f64, usize) {
-    let n = data.len();
-    let mut sum_sq_err = 0.0;
-
-    let mut full_model = Renegade::new();
-    for (point, output) in data {
-        full_model.add(point.clone(), *output);
-    }
-    let k = full_model.get_optimal_k();
-
-    for i in 0..n {
-        let mut model = Renegade::new();
-        for (j, (point, output)) in data.iter().enumerate() {
-            if j != i {
-                model.add(point.clone(), *output);
-            }
-        }
-
-        let neighbors = model.query_k(&data[i].0, k);
-        let predicted = neighbors.weighted_mean();
-        let err = predicted - data[i].1;
-        sum_sq_err += err * err;
-    }
-
-    ((sum_sq_err / n as f64).sqrt(), k)
-}
-
 #[test]
 fn iris_auto_k() {
     let data = load_iris();
@@ -441,14 +414,61 @@ fn wine_auto_k() {
     );
 }
 
+/// LOO regression RMSE using the full model's auto-selected configuration.
+/// Trains once on all data to select k/metric/kernel, then evaluates each
+/// fold using that configuration — matches what a user would experience.
+fn loo_auto_regression_rmse_v2<P: DataPoint + Clone>(
+    data: &[(P, f64)],
+) -> (f64, usize, Option<f64>) {
+    let n = data.len();
+    let mut sum_sq_err = 0.0;
+
+    // Train full model to determine configuration
+    let mut full_model = Renegade::new();
+    for (point, output) in data {
+        full_model.add(point.clone(), *output);
+    }
+    let _ = full_model.predict(&data[0].0); // force training
+    let diag = full_model.diagnostics();
+    let k = diag.optimal_k.unwrap();
+    let bandwidth = diag.kernel_bandwidth;
+
+    for i in 0..n {
+        let mut model = Renegade::new();
+        for (j, (point, output)) in data.iter().enumerate() {
+            if j != i {
+                model.add(point.clone(), *output);
+            }
+        }
+
+        let predicted = if let Some(h) = bandwidth {
+            let max_k = ((n - 1) as f64).sqrt().ceil() as usize;
+            let neighbors = model.query_k(&data[i].0, max_k);
+            neighbors.gaussian_weighted_mean(h)
+        } else {
+            let neighbors = model.query_k(&data[i].0, k);
+            neighbors.weighted_mean()
+        };
+        let err = predicted - data[i].1;
+        sum_sq_err += err * err;
+    }
+
+    ((sum_sq_err / n as f64).sqrt(), k, bandwidth)
+}
+
 #[test]
 fn auto_mpg_auto_k() {
     let data = load_auto_mpg();
-    let (rmse, k) = loo_auto_regression_rmse(&data);
+    let (rmse, k, bandwidth) = loo_auto_regression_rmse_v2(&data);
     let mean_mpg: f64 = data.iter().map(|(_, mpg)| mpg).sum::<f64>() / data.len() as f64;
+    let method = if bandwidth.is_some() {
+        "gaussian"
+    } else {
+        "hard-k"
+    };
     eprintln!(
-        "Auto MPG LOO RMSE (auto k={}): {:.2} (mean MPG: {:.1})",
-        k, rmse, mean_mpg
+        "Auto MPG LOO RMSE (auto k={}, {}): {:.2} (mean MPG: {:.1})",
+        k, method, rmse, mean_mpg
     );
     assert!(
         rmse < 4.5,
