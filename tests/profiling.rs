@@ -1,6 +1,6 @@
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use renegade::{DataPoint, Renegade};
+use renegade_ml::{DataPoint, Renegade};
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
@@ -238,7 +238,7 @@ fn profile_training_and_inference() {
         };
 
         let t0 = Instant::now();
-        let tree = renegade::vptree::VpTree::build(n, &dist_fn);
+        let tree = renegade_ml::vptree::VpTree::build(n, &dist_fn);
         let build_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         // VP-tree query (average of 100)

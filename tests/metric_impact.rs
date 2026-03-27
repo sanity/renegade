@@ -1,6 +1,6 @@
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
-use renegade::{DataPoint, Renegade};
+use renegade_ml::{DataPoint, Renegade};
 
 /// Generic numeric point with arbitrary feature count.
 #[derive(Clone, Debug)]

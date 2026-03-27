@@ -1,4 +1,4 @@
-use renegade::{DataPoint, Renegade};
+use renegade_ml::{DataPoint, Renegade};
 
 /// Generic numeric point that works with any CSV dataset.
 #[derive(Clone, Debug)]

@@ -1,4 +1,4 @@
-use renegade::{DataPoint, Renegade};
+use renegade_ml::{DataPoint, Renegade};
 
 // --- Iris dataset ---
 
