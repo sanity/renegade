@@ -1,5 +1,8 @@
 # Renegade
 
+[![Crates.io](https://img.shields.io/crates/v/renegade-ml.svg)](https://crates.io/crates/renegade-ml)
+[![docs.rs](https://docs.rs/renegade-ml/badge.svg)](https://docs.rs/renegade-ml)
+
 A nonparametric supervised learning library for Rust. Zero configuration, competitive with scikit-learn out of the box.
 
 Renegade is a KNN-based learner that **just works** — no hyperparameters to tune, no preprocessing pipeline to configure. It handles mixed numeric and categorical features, automatically selects K, learns which features matter, and indexes data for fast queries. You add data, you get predictions.
