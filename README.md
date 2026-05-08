@@ -129,6 +129,6 @@ let pred = model.predict_with_diagnostics(&query, k);
 
 ## License
 
-AGPL-3.0-or-later
+LGPL-3.0-or-later
 
-If AGPL doesn't work for your use case, alternative licensing is available — reach out on [X (@sanity)](https://x.com/sanity) or open a [GitHub issue](https://github.com/sanity/renegade/issues).
+If LGPL doesn't work for your use case, alternative licensing is available — reach out on [X (@sanity)](https://x.com/sanity) or open a [GitHub issue](https://github.com/sanity/renegade/issues).
