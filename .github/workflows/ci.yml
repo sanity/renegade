@@ -20,7 +20,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Declare rustfmt/clippy explicitly: dtolnay@stable installs a MINIMAL
+      # profile, which worked on GitHub-hosted images only because they
+      # preinstall a full toolchain. On the self-hosted runner the components
+      # must be requested (first run failed on `cargo fmt` without this).
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
