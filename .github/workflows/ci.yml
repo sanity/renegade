@@ -11,7 +11,12 @@ env:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Self-hosted runner on nova (free minutes, 16 cores vs 4 — the release
+    # builds and benchmark suites are CPU-bound). Runner: nova-renegade-1,
+    # isolated RUSTUP_HOME/CARGO_HOME per-runner; same setup as
+    # sanity/mediator PR #580. The benchmark tests assert accuracy (RMSE),
+    # not wall-clock time, so shared-machine load can't flake them.
+    runs-on: [self-hosted, nova]
     steps:
       - uses: actions/checkout@v4
 
