@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [master]
 
+# Cancel superseded runs: with a single self-hosted runner, stale queued
+# runs would otherwise serialize behind each other.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
