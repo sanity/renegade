@@ -6,16 +6,38 @@ on:
   pull_request:
     branches: [master]
 
+# Cancel superseded runs: with a single self-hosted runner, stale queued
+# runs would otherwise serialize behind each other.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Self-hosted runner on nova (free minutes, 16 cores vs 4 — the release
+    # builds and benchmark suites are CPU-bound). Runner: nova-renegade-1,
+    # isolated RUSTUP_HOME/CARGO_HOME per-runner; same setup as
+    # sanity/mediator PR #580. The benchmark tests assert accuracy (RMSE),
+    # not wall-clock time, so shared-machine load can't flake them.
+    #
+    # SECURITY: this repo is PUBLIC, so fork PRs are untrusted code and must
+    # NEVER run on the self-hosted machine. Only pushes (post-merge) and
+    # same-repo PRs (the owner's own branches) go to nova; fork PRs run on
+    # an isolated GitHub-hosted VM.
+    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && 'nova' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 
+      # Declare rustfmt/clippy explicitly: dtolnay@stable installs a MINIMAL
+      # profile, which worked on GitHub-hosted images only because they
+      # preinstall a full toolchain. On the self-hosted runner the components
+      # must be requested (first run failed on `cargo fmt` without this).
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
