@@ -16,7 +16,12 @@ jobs:
     # isolated RUSTUP_HOME/CARGO_HOME per-runner; same setup as
     # sanity/mediator PR #580. The benchmark tests assert accuracy (RMSE),
     # not wall-clock time, so shared-machine load can't flake them.
-    runs-on: [self-hosted, nova]
+    #
+    # SECURITY: this repo is PUBLIC, so fork PRs are untrusted code and must
+    # NEVER run on the self-hosted machine. Only pushes (post-merge) and
+    # same-repo PRs (the owner's own branches) go to nova; fork PRs run on
+    # an isolated GitHub-hosted VM.
+    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && 'nova' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 
