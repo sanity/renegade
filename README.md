@@ -91,6 +91,8 @@ K is selected automatically via leave-one-out cross-validation.
 
 For each feature, an isotonic regression learns its marginal effect on the output. Features that predict the output get high weight; noise features get zero weight. Distances are computed in this "effect space."
 
+It's the same isotonic regression used to calibrate classifier probabilities, pointed sideways: instead of mapping scores → calibrated probabilities, it maps each feature → its marginal effect on the target, and the fit's R² becomes that feature's weight.
+
 The metric is only kept when it demonstrably improves LOO error. Otherwise it falls back to simple Gower distance. **The metric never hurts.**
 
 ### VP-Tree Indexing
