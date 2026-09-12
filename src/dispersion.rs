@@ -77,9 +77,21 @@ impl Dispersion {
             .map(|(w, o)| w * (o - mean) * (o - mean))
             .sum::<f64>()
             / weight_sum;
-        let sum_w2: f64 = pairs.iter().map(|(w, _)| w * w).sum();
-        let effective_n = if sum_w2 > 0.0 {
-            weight_sum * weight_sum / sum_w2
+        // Kish's ESS, (Σw)²/Σw², is invariant to scaling every weight by the
+        // same positive constant — so compute it on weights normalized by
+        // their max instead of the raw weights. Mathematically identical,
+        // but avoids `w * w` overflowing to infinity (and the ratio
+        // collapsing to NaN) for legal large instance weights, since w² can
+        // overflow f64 long before w or Σw does.
+        let max_w = pairs.iter().fold(0.0_f64, |acc, (w, _)| acc.max(*w));
+        let effective_n = if max_w > 0.0 {
+            let scaled_sum: f64 = pairs.iter().map(|(w, _)| w / max_w).sum();
+            let scaled_sum_w2: f64 = pairs.iter().map(|(w, _)| (w / max_w).powi(2)).sum();
+            if scaled_sum_w2 > 0.0 {
+                scaled_sum * scaled_sum / scaled_sum_w2
+            } else {
+                0.0
+            }
         } else {
             0.0
         };

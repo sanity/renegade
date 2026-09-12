@@ -71,7 +71,7 @@ let predicted = model.predict(&query_peer);             // weighted mean
 let neighbors = model.query(&query_peer);               // raw neighbors
 let class_probs = neighbors.class_votes();              // classification
 let extrapolated = model.predict_extrapolated(&query);  // with R² confidence
-let dispersion = neighbors.dispersion();                 // do the neighbors agree?
+let dispersion = neighbors.dispersion();                 // agreement behind neighbors.weighted_mean()
 
 // Expire stale data
 model.retain(|_peer, _output| /* keep if recent */ true);
@@ -116,6 +116,14 @@ evidence behind it:
 Treating neighbor *count* as a proxy for neighbor *agreement* is a real trap: a
 categorical feature can pull in a large, confident-looking neighborhood built from
 observations that don't actually agree with each other.
+
+`dispersion()` always matches `weighted_mean()` on the same `Neighbors`, and
+`gaussian_dispersion(bandwidth)` always matches `gaussian_weighted_mean(bandwidth)`
+on the same `Neighbors` — but `model.predict()` picks one of the two strategies
+(and, for the Gaussian one, a different-sized neighbor set) automatically during
+training. Call `model.diagnostics().kernel_bandwidth` to find out which one is
+active if you want a dispersion figure that's guaranteed to match what
+`predict()` actually returned.
 
 ### VP-Tree Indexing
 

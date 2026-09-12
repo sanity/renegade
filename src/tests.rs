@@ -540,6 +540,40 @@ fn dispersion_effective_n_uses_kish_formula_not_raw_count() {
 }
 
 #[test]
+fn dispersion_effective_n_does_not_overflow_for_huge_weights() {
+    // Kish's ESS is scale-invariant, so two equally-weighted neighbors
+    // should report effective_n ≈ 2 whether their weight is 1.0 or 1e200.
+    // A naive (Σw)²/Σw² computed on the raw weights overflows: w² alone
+    // exceeds f64::MAX for w = 1e200, turning a well-defined finite answer
+    // into NaN.
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 1.0,
+                output: 1.0,
+                weight: 1e200,
+            },
+            Neighbor {
+                distance: 1.0,
+                output: 2.0,
+                weight: 1e200,
+            },
+        ],
+    };
+    let d = neighbors.dispersion().unwrap();
+    assert!(d.mean.is_finite(), "got mean {}", d.mean);
+    assert!(
+        !d.effective_n.is_nan(),
+        "effective_n should not be NaN for legal large weights"
+    );
+    assert!(
+        (d.effective_n - 2.0).abs() < 1e-6,
+        "expected effective_n ≈ 2, got {}",
+        d.effective_n
+    );
+}
+
+#[test]
 fn dispersion_variance_is_weighted_not_naive() {
     // Same distance for both (so instance_weight ratios pass through
     // unscaled), but unequal instance weights and outputs — this
