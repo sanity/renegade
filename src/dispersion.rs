@@ -7,7 +7,7 @@
 /// mean it accompanies (see [`crate::Neighbors::dispersion`] and
 /// [`crate::Neighbors::gaussian_dispersion`]), so the two can never
 /// describe different populations.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Dispersion {
     /// The weighted mean these statistics are computed about. Equal to
     /// `weighted_mean()` (or `gaussian_weighted_mean(bandwidth)`) for the
