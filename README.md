@@ -71,6 +71,7 @@ let predicted = model.predict(&query_peer);             // weighted mean
 let neighbors = model.query(&query_peer);               // raw neighbors
 let class_probs = neighbors.class_votes();              // classification
 let extrapolated = model.predict_extrapolated(&query);  // with R² confidence
+let dispersion = neighbors.dispersion();                 // do the neighbors agree?
 
 // Expire stale data
 model.retain(|_peer, _output| /* keep if recent */ true);
@@ -94,6 +95,27 @@ For each feature, an isotonic regression learns its marginal effect on the outpu
 It's the same isotonic regression used to calibrate classifier probabilities, pointed sideways: instead of mapping scores → calibrated probabilities, it maps each feature → its marginal effect on the target, and the fit's R² becomes that feature's weight.
 
 The metric is only kept when it demonstrably improves LOO error. Otherwise it falls back to simple Gower distance. **The metric never hurts.**
+
+### Dispersion: Do the Neighbors Agree?
+
+A weighted mean alone can't tell you whether the neighborhood behind it agreed, or
+whether a few outliers happened to cancel out against a pile of unrelated noise —
+both can produce the same point estimate. `neighbors.dispersion()` (and
+`neighbors.gaussian_dispersion(bandwidth)` for the Gaussian-kernel prediction path)
+report weighted variance/std-dev about that same mean, plus two ways to size the
+evidence behind it:
+
+- **`effective_n`** (Kish's effective sample size) answers "how many roughly
+  independent observations back this estimate" — but it's scale-invariant, so k
+  neighbors report `effective_n ≈ k` no matter how far away they are.
+- **`weight_sum`** is the raw kernel mass. For `gaussian_dispersion`'s bounded
+  kernel it decays toward 0 as the query moves away from the training data, so
+  it's the one to use for "is there evidence *near* this query" — `dispersion()`'s
+  inverse-distance kernel is unbounded and doesn't have that property.
+
+Treating neighbor *count* as a proxy for neighbor *agreement* is a real trap: a
+categorical feature can pull in a large, confident-looking neighborhood built from
+observations that don't actually agree with each other.
 
 ### VP-Tree Indexing
 

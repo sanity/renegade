@@ -1,4 +1,5 @@
 mod diagnostics;
+mod dispersion;
 mod metric;
 mod neighbor;
 mod predict;
@@ -8,6 +9,7 @@ pub mod vptree;
 pub use diagnostics::{
     FeatureDiagnostics, ModelDiagnostics, NeighborDetail, OutputStats, PredictionDiagnostics,
 };
+pub use dispersion::Dispersion;
 pub use metric::LearnedMetric;
 pub use neighbor::{Neighbor, Neighbors};
 pub use predict::ExtrapolatedPrediction;
