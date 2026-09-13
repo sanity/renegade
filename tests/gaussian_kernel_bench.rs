@@ -192,3 +192,104 @@ fn wine_quality_gaussian_vs_hard_k() {
     eprintln!("  predict_k(5) RMSE: {:.4}", rmse_k5);
     eprintln!("  Improvement: {:.4}", rmse_k5 - rmse_predict);
 }
+
+// --- predict() (raw) vs predict_with_prior() (shrunk toward the global
+// mean) -- the durable evidence behind the decision, documented on
+// Renegade::predict_with_prior, to keep shrink-by-default OPT-IN rather
+// than predict()'s default. Regenerates the real-dataset comparison from
+// the shipped API, per review feedback that the original evidence lived
+// only in a doc comment / PR description and couldn't be rerun. ---
+
+/// LOO comparison of predict() (raw) against predict_with_prior(query,
+/// global_output_mean()) (shrunk), using the SAME per-fold model (and
+/// therefore the same auto-selected k/bandwidth/neighbors) for both, so the
+/// only variable measured is the shrinkage step itself.
+fn loo_predict_vs_predict_with_prior(data: &[(CsvPoint, f64)]) -> (f64, f64) {
+    let n = data.len();
+    let mut sse_raw = 0.0;
+    let mut sse_shrunk = 0.0;
+
+    for i in 0..n {
+        let mut model = Renegade::new();
+        for (j, (p, y)) in data.iter().enumerate() {
+            if j != i {
+                model.add(p.clone(), *y);
+            }
+        }
+        let raw = model.predict(&data[i].0);
+        let prior = model.global_output_mean().unwrap();
+        let shrunk = model.predict_with_prior(&data[i].0, prior);
+        let err_raw = raw - data[i].1;
+        let err_shrunk = shrunk - data[i].1;
+        sse_raw += err_raw * err_raw;
+        sse_shrunk += err_shrunk * err_shrunk;
+    }
+
+    ((sse_raw / n as f64).sqrt(), (sse_shrunk / n as f64).sqrt())
+}
+
+#[test]
+fn auto_mpg_predict_with_prior_vs_raw() {
+    // Regenerates the auto_mpg figure cited in Renegade::predict_with_prior's
+    // doc comment. LOO is slow at this dataset's size with the full
+    // predict()+predict_with_prior double-training per fold, so this uses
+    // the same dataset/methodology as auto_mpg_gaussian_vs_hard_k above.
+    let data = load_csv_target(include_str!("../testdata/auto_mpg.csv"), Some(0));
+    let (rmse_raw, rmse_shrunk) = loo_predict_vs_predict_with_prior(&data);
+    eprintln!("=== Auto MPG: predict() vs predict_with_prior(global_mean) ===");
+    eprintln!("  raw RMSE:    {rmse_raw:.4}");
+    eprintln!("  shrunk RMSE: {rmse_shrunk:.4}");
+    eprintln!("  delta: {:+.4}", rmse_shrunk - rmse_raw);
+    // Documented finding: shrinking toward the global mean by default is a
+    // small but real regression on this real, general-purpose dataset.
+    // Pin the DIRECTION (not an exact number, which is sensitive to any
+    // future change in k-selection/metric-learning) as evidence this
+    // finding stays true; if it flips, predict_with_prior's doc comment
+    // needs updating, not this assertion loosened silently.
+    assert!(
+        rmse_shrunk > rmse_raw,
+        "expected shrink-by-default to be a small regression on auto_mpg (documented finding): raw={rmse_raw:.4} shrunk={rmse_shrunk:.4}"
+    );
+}
+
+#[test]
+fn wine_quality_predict_with_prior_vs_raw() {
+    // Regenerates the wine_quality figure cited in
+    // Renegade::predict_with_prior's doc comment. Train/test split (LOO too
+    // slow for 4898 points), same split as wine_quality_gaussian_vs_hard_k.
+    let data = load_csv_target(include_str!("../testdata/wine_quality.csv"), None);
+    let split = (data.len() as f64 * 0.8) as usize;
+    let (train, test) = data.split_at(split);
+
+    let mut model = Renegade::new();
+    for (p, y) in train {
+        model.add(p.clone(), *y);
+    }
+    let _ = model.predict(&test[0].0); // force training
+    let prior = model.global_output_mean().unwrap();
+
+    let mut sse_raw = 0.0;
+    let mut sse_shrunk = 0.0;
+    for (p, y) in test {
+        let raw = model.predict(p);
+        let shrunk = model.predict_with_prior(p, prior);
+        sse_raw += (raw - y).powi(2);
+        sse_shrunk += (shrunk - y).powi(2);
+    }
+    let rmse_raw = (sse_raw / test.len() as f64).sqrt();
+    let rmse_shrunk = (sse_shrunk / test.len() as f64).sqrt();
+
+    eprintln!("=== Wine Quality: predict() vs predict_with_prior(global_mean) ===");
+    eprintln!("  raw RMSE:    {rmse_raw:.4}");
+    eprintln!("  shrunk RMSE: {rmse_shrunk:.4}");
+    eprintln!("  delta: {:+.4}", rmse_shrunk - rmse_raw);
+    // Documented finding: shrinking toward the global mean by default is a
+    // genuine improvement on this real, general-purpose dataset -- the
+    // MIXED picture (helps here, hurts auto_mpg, hurts badly on the
+    // synthetic signal-boundary scenario) is exactly why this stays opt-in
+    // rather than becoming predict()'s default.
+    assert!(
+        rmse_shrunk < rmse_raw,
+        "expected shrink-by-default to improve wine_quality (documented finding): raw={rmse_raw:.4} shrunk={rmse_shrunk:.4}"
+    );
+}

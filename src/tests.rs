@@ -1633,6 +1633,25 @@ fn global_output_mean_survives_retain() {
     assert!((mean - 8.0).abs() < 1e-9, "expected 8.0, got {mean}");
 }
 
+#[test]
+fn global_output_mean_documented_overflow_boundary_is_visible_not_silent() {
+    // Pins the documented (not "fixed" -- see the output_weight_sum field
+    // docs for why) overflow boundary found in review: outputs of opposite
+    // sign each individually near f64::MAX have a perfectly representable
+    // true mean, but the incremental accumulator can overflow computing it.
+    // The key property this test protects: the failure is VISIBLE
+    // (infinite), not a silently-wrong finite number.
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 1e308, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), -1e308, 1.0);
+    let mean = model.global_output_mean().unwrap();
+    assert!(
+        !mean.is_finite(),
+        "known boundary: expected a non-finite (visible) result for this adversarial input, got {mean}"
+    );
+}
+
 // --- Renegade::predict_with_prior ---
 
 #[test]
@@ -1645,10 +1664,11 @@ fn predict_with_prior_matches_manual_composition() {
     let range = (0.0, 10.0);
     let mut model = Renegade::new();
     let mut rng = SmallRng::seed_from_u64(99);
-    for _ in 0..40 {
+    for i in 0..40 {
         let x: f64 = rng.gen_range(0.0..10.0);
         let y: f64 = rng.gen_range(0.0..10.0);
-        model.add(Point2D::new(x, y, range, range), x + y);
+        let weight = 1.0 + (i % 4) as f64; // unequal weights, 1.0..=4.0
+        model.add_weighted(Point2D::new(x, y, range, range), x + y, weight);
     }
     let query = Point2D::new(3.0, 7.0, range, range);
     let prior = 123.0;
@@ -1713,16 +1733,21 @@ fn predict_with_prior_trusts_local_mean_when_position_strongly_predicts_output()
 }
 
 #[test]
-fn predict_unaffected_by_predict_with_prior_existing() {
+fn predict_stays_raw_local_mean_after_query_for_predict_refactor() {
     // predict() must remain the raw local mean -- shrinkage is opt-in via
-    // predict_with_prior, never predict()'s default.
+    // predict_with_prior, never predict()'s default. This also pins the
+    // query_for_predict refactor: predict() and predict_with_prior share
+    // that helper now, so this guards against predict() picking up
+    // shrinkage by accident in a future edit. Unequal weights so this
+    // can't pass under a broken/unweighted query_for_predict.
     let range = (0.0, 10.0);
     let mut model = Renegade::new();
     let mut rng = SmallRng::seed_from_u64(7);
-    for _ in 0..30 {
+    for i in 0..30 {
         let x: f64 = rng.gen_range(0.0..10.0);
         let y: f64 = rng.gen_range(0.0..10.0);
-        model.add(Point2D::new(x, y, range, range), x + y);
+        let weight = 1.0 + (i % 3) as f64; // 1.0, 2.0, 3.0, repeating
+        model.add_weighted(Point2D::new(x, y, range, range), x + y, weight);
     }
     let query = Point2D::new(5.0, 5.0, range, range);
     let predicted = model.predict(&query);

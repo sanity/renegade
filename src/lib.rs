@@ -85,6 +85,23 @@ pub struct Renegade<P: DataPoint> {
     // bounded by "a few ULPs negative", so `.max(0.0)` does not save it).
     // West's algorithm has no such cancellation regardless of magnitude,
     // while remaining exactly O(1) amortized per point.
+    //
+    // It has a DIFFERENT, narrower failure mode instead: the incremental
+    // mean update (`delta = output - output_mean`, see `accumulate_output`)
+    // can itself overflow f64 for outputs of opposite sign each individually
+    // within roughly a factor of 2 of f64::MAX (e.g. 1e308 and -1e308 have a
+    // perfectly representable true mean of 0.0, but computing their
+    // difference during the update overflows to -Infinity, so
+    // `global_output_mean()`/`global_output_variance()` report an infinite
+    // rather than the true finite answer). This is a boundary of f64
+    // representability, not specific to West's algorithm — any accumulator
+    // needs SOME subtraction or sum of the raw values, and no realistic
+    // regression target (routing metrics, distances, latencies, ...) comes
+    // remotely close to 1e308 in magnitude. Documented here rather than
+    // "fixed" with extended-precision arithmetic, since that complexity
+    // isn't proportionate to inputs this extreme — but note the failure is
+    // at least visible (±Infinity, not a plausible-looking wrong finite
+    // number) rather than silent.
     /// Σ instance_weight, over all stored points.
     output_weight_sum: f64,
     /// Running weighted mean of all stored outputs.
@@ -409,43 +426,50 @@ impl<P: DataPoint + Clone> Renegade<P> {
     /// estimate = prior + λ·(local_mean − prior)
     /// ```
     ///
-    /// via the same [`Self::shrink`]/[`Dispersion::shrink_toward`] machinery
-    /// as the rest of this crate's shrinkage API, using
-    /// [`Self::local_signal_variance`] for the signal-variance term.
+    /// using the same [`Dispersion::shrink_toward`]/[`Self::local_signal_variance`]
+    /// building blocks [`Self::shrink`] is built on — not a call to
+    /// `shrink()` itself, since `shrink()` only supports the
+    /// inverse-distance `dispersion()` path, while this also needs to
+    /// handle the Gaussian-kernel path `predict()` may have selected.
     ///
     /// **This was evaluated as `predict()`'s new DEFAULT and rejected** —
     /// worth recording here since the obvious next question is "why is this
-    /// opt-in rather than automatic". Two independent shrinkage formulas
-    /// (this crate's `local_signal_variance` subtraction, and the more
-    /// direct `λ = n_eff/(n_eff + σ²_local/σ²_global)` ratio) were measured
-    /// against a reconstruction of the exact motivating scenario (a mostly-
-    /// flat regression target with a small, genuinely learnable localized
-    /// region — see `tests/`), plus this crate's own real-dataset LOO
-    /// benchmarks:
+    /// opt-in rather than automatic". Measured (with this exact shrinkage —
+    /// `local_signal_variance` — against `predict()`'s raw output) on this
+    /// crate's own real-dataset LOO benchmarks, and against a reconstruction
+    /// of the exact motivating scenario (a mostly-flat regression target
+    /// with a small, genuinely learnable localized region). All of the
+    /// following are committed, rerunnable tests, not one-off numbers —
+    /// see `tests/gaussian_kernel_bench.rs` (`*_predict_with_prior_vs_raw`)
+    /// and `tests/shrinkage_by_default_evidence.rs`:
     ///
     /// - **auto_mpg** (real regression dataset): shrink-by-default RMSE
     ///   2.5809 vs. raw 2.5746 — a small but real regression.
     /// - **wine_quality** (real regression dataset): shrink-by-default RMSE
-    ///   0.7191 vs. raw 0.7537 — a genuine ~4.6% improvement.
+    ///   0.7191 vs. raw 0.7537 — a genuine ~4.6% improvement. Real datasets
+    ///   give a genuinely MIXED picture, not a uniform regression.
     /// - **Synthetic 92%-flat/8%-signal reconstruction**: shrink-by-default
-    ///   made BOTH the overall MSE (0.83–1.61 vs. 0.59 raw, both formulas
-    ///   worse) AND the signal-region MSE (4.65–14.21 vs. 1.47 raw, both
-    ///   formulas dramatically worse) worse than the raw local mean — the
-    ///   opposite of the intended effect on the exact case this was meant
-    ///   to fix.
+    ///   made the signal-region MSE dramatically worse (14.21 vs. 1.47 raw,
+    ///   one seed; confirmed worse across 7 seeds in
+    ///   `shrink_by_default_signal_region_harm_is_consistent_across_seeds`)
+    ///   — the opposite of the intended effect on the exact case this was
+    ///   meant to fix. Overall MSE was also worse for this seed (1.61 vs.
+    ///   0.59 raw) but is a noisier signal across seeds/formulas than the
+    ///   signal-region figure — the signal-region harm is the robust,
+    ///   decision-relevant finding, not "every metric always gets worse".
     ///
-    /// The mechanism: `local_signal_variance` (in either form) treats "this
-    /// neighborhood's own variance is unusually HIGH relative to the
-    /// dataset overall" as evidence of "no local signal, shrink hard" — but
-    /// a neighborhood straddling the BOUNDARY between a real signal region
-    /// and the flat background also has high local variance (a mix of two
-    /// true regimes, not noise), and gets shrunk just as hard, discarding a
-    /// local mean that was already a reasonable (if imperfect) estimate.
-    /// This is not a tuning issue — it's a structural property of using
-    /// local-vs-global variance comparison as a trust signal: it cannot
-    /// distinguish "no structure here" from "structure that changes
-    /// sharply right here", and the latter is arguably the case where a
-    /// routing decision matters most.
+    /// The mechanism: `local_signal_variance` treats "this neighborhood's
+    /// own variance is unusually HIGH relative to the dataset overall" as
+    /// evidence of "no local signal, shrink hard" — but a neighborhood
+    /// straddling the BOUNDARY between a real signal region and the flat
+    /// background also has high local variance (a mix of two true regimes,
+    /// not noise), and gets shrunk just as hard, discarding a local mean
+    /// that was already a reasonable (if imperfect) estimate. This is not a
+    /// tuning issue — it's a structural property of using local-vs-global
+    /// variance comparison as a trust signal: it cannot distinguish "no
+    /// structure here" from "structure that changes sharply right here",
+    /// and the latter is arguably the case where a routing decision matters
+    /// most.
     ///
     /// Given a wrong default is worse than no default, shrinkage stays
     /// opt-in. Use this method when you've evaluated it on your own data
@@ -520,12 +544,16 @@ impl<P: DataPoint + Clone> Renegade<P> {
     /// Weighted mean of every stored output — the running mean maintained
     /// internally by the same West's-algorithm accumulator that backs
     /// [`Self::global_output_variance`], exposed directly since it's already
-    /// computed as a byproduct. This is [`Self::predict`]'s default
-    /// shrinkage target.
+    /// computed as a byproduct. A natural choice of `prior` for
+    /// [`Self::predict_with_prior`] when the caller has no better one, though
+    /// `predict()` itself does NOT use this as a default — see
+    /// `predict_with_prior`'s doc comment for why shrinkage stays opt-in.
     ///
     /// `None` under the same degenerate conditions as
     /// `global_output_variance` (no data, or every instance weight
-    /// non-positive).
+    /// non-positive). Can return `Some(an infinite value)` for outputs of
+    /// opposite sign each individually near `f64::MAX` — see the caveat on
+    /// the `output_weight_sum` field.
     pub fn global_output_mean(&self) -> Option<f64> {
         if self.output_weight_sum <= 0.0 {
             None
@@ -550,7 +578,9 @@ impl<P: DataPoint + Clone> Renegade<P> {
     /// via West's algorithm instead of the more obvious "derive variance
     /// from Σw/Σw·o/Σw·o²" formula, which both loses precision AND would
     /// silently launder a NaN result to a confident-looking `Some(0.0)`
-    /// via a naive `.max(0.0)` clamp.
+    /// via a naive `.max(0.0)` clamp. Extreme-magnitude (near `f64::MAX`)
+    /// opposite-sign stored outputs have a separate, narrower overflow
+    /// boundary — see the field docs on `output_weight_sum`.
     pub fn global_output_variance(&self) -> Option<f64> {
         if self.output_weight_sum <= 0.0 {
             return None;
