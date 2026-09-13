@@ -125,6 +125,44 @@ training. Call `model.diagnostics().kernel_bandwidth` to find out which one is
 active if you want a dispersion figure that's guaranteed to match what
 `predict()` actually returned.
 
+### Shrinkage: How Much Should You Trust This Mean?
+
+A small, high-variance neighborhood is exactly where `weighted_mean()` is least
+reliable — few points, disagreeing outputs. `dispersion().standard_error()` gives
+the standard error of that mean (`sqrt(variance / effective_n)` — `effective_n`,
+never `weight_sum`, for the same reason `Dispersion` itself uses it), and
+`shrink_toward(prior, signal_variance)` pulls the mean toward a caller-supplied
+`prior` by an amount that depends on it:
+
+```rust
+let neighbors = model.query(&query);
+let dispersion = neighbors.dispersion().unwrap();
+
+// signal_variance: how much of the dataset's spread is real local signal,
+// as opposed to noise, near this particular query.
+let signal_variance = model.local_signal_variance(&dispersion).unwrap();
+let shrunk = dispersion.shrink_toward(global_prior, signal_variance);
+
+shrunk.estimate  // prior + lambda * (dispersion.mean - prior)
+shrunk.lambda    // 0 (fully trust the prior) .. 1 (fully trust the local mean)
+```
+
+`model.shrink(&neighbors, prior)` wires this together in one call, using the
+model's own `local_signal_variance` — the recommended entry point unless the
+Gaussian-kernel dispersion is what you're shrinking.
+
+The subtlety is `signal_variance`. A single global "how much does the signal
+vary" constant gets inflated by any strongly localized effect elsewhere in the
+dataset, which keeps `lambda` high — trusting a noisy local mean — even in a flat
+region with no real signal at all. `local_signal_variance` instead compares THIS
+neighborhood's dispersion against `global_output_variance()` (the variance of
+every stored output): a neighborhood no tighter than the dataset as a whole has
+demonstrated no more than noise, so signal ≈ 0 and shrinkage is aggressive; a
+neighborhood far tighter than the dataset as a whole has captured something real,
+so signal stays high and the local mean is trusted. It's a method-of-moments
+estimate (the same local/global variance split a one-way ANOVA uses), not a
+calibrated quantity — noisiest exactly when `effective_n` is small.
+
 ### VP-Tree Indexing
 
 A vantage-point tree provides **exact** nearest neighbor search (not approximate) with any distance function. Queries are O(log n) average case — 347× faster than brute force at 10k points.

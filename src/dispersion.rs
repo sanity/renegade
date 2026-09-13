@@ -104,4 +104,105 @@ impl Dispersion {
             weight_sum,
         }
     }
+
+    /// Standard error of `mean`: `sqrt(variance / effective_n)`.
+    ///
+    /// Uses `effective_n` (Kish's effective sample size), never `weight_sum`
+    /// — this answers "how precisely is `mean` pinned down by roughly this
+    /// many independent-ish observations", which is `effective_n`'s job by
+    /// definition (see its doc comment). `weight_sum` is raw kernel mass;
+    /// dividing by it would conflate "how much evidence is nearby" with "how
+    /// many independent samples does that evidence represent", which for an
+    /// unbounded kernel (`dispersion()`) or a large uniform weight are not
+    /// the same number at all.
+    ///
+    /// Caveat: this is a plug-in estimator computed entirely from the
+    /// neighbors it was built from, so it inherits their limits. With a
+    /// single neighbor (or several neighbors that all agree exactly),
+    /// `variance` is exactly zero by construction — there is nothing in the
+    /// neighbor set itself to measure spread against — so `standard_error()`
+    /// reports 0 (maximal confidence) rather than reflecting the real
+    /// uncertainty of estimating a mean from few observations. Callers that
+    /// need a noise floor for small neighborhoods should combine this with a
+    /// separate estimate (e.g. [`crate::Renegade::local_signal_variance`]'s
+    /// global comparison) rather than trusting `standard_error()` alone at
+    /// low `effective_n`.
+    pub fn standard_error(&self) -> f64 {
+        (self.variance / self.effective_n).sqrt()
+    }
+
+    /// Empirical-Bayes (James-Stein form) shrinkage of `mean` toward a
+    /// caller-supplied `prior`:
+    ///
+    /// ```text
+    /// estimate = prior + λ · (mean − prior)
+    /// λ = signal_variance / (signal_variance + standard_error()²)
+    /// ```
+    ///
+    /// `prior` is domain knowledge the crate has no way to know — a global
+    /// mean, a baseline rate, the model's own global prediction, whatever
+    /// the caller would fall back to with zero local evidence. `signal_variance`
+    /// is the between-neighborhood variance of the TRUE target: how much
+    /// legitimate local signal is there to trust, as opposed to noise.
+    /// [`crate::Renegade::local_signal_variance`] estimates it per-query from
+    /// the model's own data; see its docs for why a single global constant
+    /// is the wrong shape for this — it means using a domain-specific prior.
+    ///
+    /// λ is the fraction of the gap between `prior` and `mean` that survives:
+    /// λ → 1 as the local estimate gets more precise (`standard_error` → 0)
+    /// or the neighborhood carries more real signal (`signal_variance` grows)
+    /// — trust the local mean fully. λ → 0 as the local estimate gets noisier
+    /// or the neighborhood carries no more signal than chance would produce
+    /// — fall back to the prior.
+    ///
+    /// `signal_variance` must be non-negative; NaN propagates (as does a NaN
+    /// or infinite `prior`, `mean`, or `standard_error`), a negative
+    /// non-NaN value is clamped to 0 (fully shrink to the prior — treated as
+    /// "no local signal detected" rather than an error). When both
+    /// `signal_variance` and `standard_error()` are exactly zero — no signal
+    /// estimate AND no measured spread (e.g. a single exact-match neighbor)
+    /// — there is nothing to distinguish trusting the local mean from
+    /// trusting the prior; this degenerate case defaults to λ = 1 (trust the
+    /// local observation), matching how `Dispersion` itself treats a single
+    /// pair as its own whole population.
+    pub fn shrink_toward(&self, prior: f64, signal_variance: f64) -> Shrinkage {
+        let signal_variance = if signal_variance.is_nan() {
+            signal_variance
+        } else {
+            signal_variance.max(0.0)
+        };
+        let standard_error = self.standard_error();
+        let denom = signal_variance + standard_error * standard_error;
+        let lambda = if denom > 0.0 {
+            (signal_variance / denom).clamp(0.0, 1.0)
+        } else if denom == 0.0 {
+            1.0
+        } else {
+            // Unreachable for finite non-NaN inputs (both terms are
+            // non-negative), so only a NaN operand lands here.
+            f64::NAN
+        };
+
+        Shrinkage {
+            estimate: prior + lambda * (self.mean - prior),
+            lambda,
+            standard_error,
+        }
+    }
+}
+
+/// Result of [`Dispersion::shrink_toward`]: a local mean pulled toward a
+/// prior by an amount that depends on how much the local evidence is worth
+/// trusting.
+#[derive(Debug, Clone)]
+pub struct Shrinkage {
+    /// `prior + lambda * (mean - prior)`.
+    pub estimate: f64,
+    /// Shrinkage weight in `[0, 1]`. `1.0` = fully trust the local mean,
+    /// `0.0` = fully fall back to the prior.
+    pub lambda: f64,
+    /// `Dispersion::standard_error()` of the local mean being shrunk —
+    /// carried through so callers can see the precision behind `lambda`
+    /// without recomputing it.
+    pub standard_error: f64,
 }

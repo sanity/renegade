@@ -9,7 +9,7 @@ pub mod vptree;
 pub use diagnostics::{
     FeatureDiagnostics, ModelDiagnostics, NeighborDetail, OutputStats, PredictionDiagnostics,
 };
-pub use dispersion::Dispersion;
+pub use dispersion::{Dispersion, Shrinkage};
 pub use metric::LearnedMetric;
 pub use neighbor::{Neighbor, Neighbors};
 pub use predict::ExtrapolatedPrediction;
@@ -65,6 +65,21 @@ pub struct Renegade<P: DataPoint> {
     /// Number of features per data point (0 until first point is added).
     num_features: usize,
 
+    // --- Running sums for global output variance (see `global_output_variance`) ---
+    // Maintained incrementally on `add_weighted` (O(1) per point) and
+    // recomputed from scratch on `retain` (already O(n) there). Kept
+    // separate from the per-query `Dispersion` machinery in dispersion.rs:
+    // these describe the WHOLE dataset, not one neighbor set, and a query
+    // may run once per routing decision, so recomputing Σw·o and Σw·o² over
+    // every stored point on every call would undo the amortized-training
+    // design this crate otherwise commits to.
+    /// Σ instance_weight, over all stored points.
+    output_weight_sum: f64,
+    /// Σ instance_weight * output, over all stored points.
+    output_weighted_sum: f64,
+    /// Σ instance_weight * output², over all stored points.
+    output_weighted_sq_sum: f64,
+
     // --- Training state ---
     optimal_k: Option<usize>,
     learned_metric: Option<LearnedMetric>,
@@ -94,6 +109,9 @@ impl<P: DataPoint + Clone> Renegade<P> {
             outputs: Vec::new(),
             instance_weights: Vec::new(),
             num_features: 0,
+            output_weight_sum: 0.0,
+            output_weighted_sum: 0.0,
+            output_weighted_sq_sum: 0.0,
             optimal_k: None,
             learned_metric: None,
             kernel_bandwidth: None,
@@ -132,6 +150,9 @@ impl<P: DataPoint + Clone> Renegade<P> {
         self.outputs.push(output);
         self.instance_weights.push(weight);
         self.points.push(point);
+        self.output_weight_sum += weight;
+        self.output_weighted_sum += weight * output;
+        self.output_weighted_sq_sum += weight * output * output;
 
         // Invalidate metric/K if dataset has grown 50% since last training
         if self.computed_at > 0 && self.len() >= self.computed_at + self.computed_at / 2 {
@@ -189,7 +210,22 @@ impl<P: DataPoint + Clone> Renegade<P> {
         self.outputs.truncate(write);
         self.instance_weights.truncate(write);
         self.values_flat.truncate(write * nf);
+        self.recompute_output_sums();
         self.invalidate();
+    }
+
+    /// Recompute the running Σw, Σw·o, Σw·o² sums from scratch. Only needed
+    /// after a bulk removal (`retain`) — `add_weighted` maintains them
+    /// incrementally since it only ever adds.
+    fn recompute_output_sums(&mut self) {
+        self.output_weight_sum = 0.0;
+        self.output_weighted_sum = 0.0;
+        self.output_weighted_sq_sum = 0.0;
+        for (&w, &o) in self.instance_weights.iter().zip(self.outputs.iter()) {
+            self.output_weight_sum += w;
+            self.output_weighted_sum += w * o;
+            self.output_weighted_sq_sum += w * o * o;
+        }
     }
 
     /// Force recomputation of the metric and K on the next query.
@@ -357,6 +393,98 @@ impl<P: DataPoint + Clone> Renegade<P> {
     pub fn predict_k_extrapolated(&self, query: &P, k: usize) -> ExtrapolatedPrediction {
         let neighbors = self.query_k(query, k);
         neighbors.extrapolate()
+    }
+
+    /// Weighted variance of every stored output, treating the whole training
+    /// set as one population — `Σw(o - mean)² / Σw` over every point ever
+    /// added (and still present after any `retain`). This is the crate's
+    /// only "global" statistic; everything else (`Dispersion`, `Neighbors`)
+    /// describes one query's neighborhood.
+    ///
+    /// `None` if there is no data, or if every instance weight is
+    /// non-positive (the same degenerate case `Dispersion` falls back on —
+    /// see its `from_weighted_pairs`).
+    pub fn global_output_variance(&self) -> Option<f64> {
+        if self.output_weight_sum <= 0.0 {
+            return None;
+        }
+        let mean = self.output_weighted_sum / self.output_weight_sum;
+        let mean_of_squares = self.output_weighted_sq_sum / self.output_weight_sum;
+        // Clamp against float cancellation: mean_of_squares - mean² is
+        // mathematically >= 0 but can land a few ULPs negative when the
+        // dataset's variance is tiny relative to its mean's magnitude.
+        Some((mean_of_squares - mean * mean).max(0.0))
+    }
+
+    /// Estimate the between-neighborhood ("signal") variance of the target
+    /// near a query, for use as `signal_variance` in
+    /// [`Dispersion::shrink_toward`].
+    ///
+    /// Decomposes the GLOBAL variance of every stored output into a LOCAL
+    /// component — `local.variance`, the given neighborhood's own dispersion,
+    /// treated as noise — and whatever variance is left over, attributed to
+    /// genuine local signal:
+    ///
+    /// ```text
+    /// signal_variance ≈ max(0, global_output_variance() − local.variance)
+    /// ```
+    ///
+    /// Rationale: a neighborhood whose outputs agree about as tightly as the
+    /// dataset overall (`local.variance ≈ global_output_variance()`) has
+    /// demonstrated no more structure than noise alone would produce —
+    /// signal ≈ 0, so `shrink_toward` shrinks hard toward the prior. A
+    /// neighborhood that agrees far more tightly than the dataset overall
+    /// (`local.variance` well below the global figure) has captured
+    /// something real; signal stays close to the global variance, so
+    /// `shrink_toward` keeps trusting the local mean.
+    ///
+    /// This is deliberately a PER-QUERY estimate, not a single global
+    /// constant. A single global "how much does the signal vary" number gets
+    /// inflated by any strongly localized effect elsewhere in the dataset —
+    /// a query sitting in a flat, no-signal region would still inherit that
+    /// inflated figure and keep `shrink_toward`'s λ high (trusting a noisy
+    /// local mean) exactly where it shouldn't. Comparing THIS neighborhood's
+    /// dispersion against the global figure, instead of using the global
+    /// figure alone, is what fixes that.
+    ///
+    /// Caveat — read before trusting this as a calibrated variance: a
+    /// neighbor set alone cannot distinguish "this neighborhood has low true
+    /// variation" from "these particular k points happen to agree by
+    /// chance". This is a method-of-moments point estimate (the same
+    /// subtraction a one-way ANOVA or a DerSimonian-Laird random-effects
+    /// meta-analysis uses to split total variance into between- and
+    /// within-group components), not a hypothesis test, and it is noisiest
+    /// exactly when `local.effective_n` is small — the same regime where
+    /// [`Dispersion::standard_error`] is least trustworthy. Treat the result
+    /// as a heuristic prior for shrinkage, not a calibrated quantity.
+    ///
+    /// Returns `None` if there's no global variance to compare against (no
+    /// training data, or every instance weight non-positive).
+    pub fn local_signal_variance(&self, local: &Dispersion) -> Option<f64> {
+        let global_variance = self.global_output_variance()?;
+        Some((global_variance - local.variance).max(0.0))
+    }
+
+    /// Convenience: shrink `neighbors.weighted_mean()` toward `prior`, using
+    /// this model's own local/global variance decomposition
+    /// ([`local_signal_variance`](Self::local_signal_variance)) as the
+    /// signal variance behind the shrinkage. This is the recommended entry
+    /// point for most callers — it wires together `Neighbors::dispersion`,
+    /// `local_signal_variance`, and `Dispersion::shrink_toward` with a
+    /// consistent, correct choice of signal variance, rather than each
+    /// caller re-deriving (and, empirically, mis-deriving) the same formula.
+    ///
+    /// Uses `neighbors.dispersion()` (the inverse-distance kernel matching
+    /// `weighted_mean()`), not `gaussian_dispersion` — call
+    /// `Dispersion::shrink_toward` directly if the Gaussian-kernel path is
+    /// what your `Neighbors` was built for.
+    ///
+    /// Returns `None` if `neighbors` is empty, or there is no training data
+    /// (or only non-positive instance weights) to compare against.
+    pub fn shrink(&self, neighbors: &Neighbors, prior: f64) -> Option<Shrinkage> {
+        let local = neighbors.dispersion()?;
+        let signal_variance = self.local_signal_variance(&local)?;
+        Some(local.shrink_toward(prior, signal_variance))
     }
 
     /// Ensure the metric and K are trained. Recomputes if needed.
