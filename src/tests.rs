@@ -1599,3 +1599,143 @@ fn shrink_toward_huge_finite_signal_and_noise_variance_near_f64_max() {
         s.lambda
     );
 }
+
+// --- Renegade::global_output_mean ---
+
+#[test]
+fn global_output_mean_empty_model_is_none() {
+    let model: Renegade<Point2D> = Renegade::new();
+    assert!(model.global_output_mean().is_none());
+}
+
+#[test]
+fn global_output_mean_matches_manual_weighted_calc() {
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    // Unequal weights.
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 2.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 10.0, 3.0);
+    let mean = model.global_output_mean().unwrap();
+    // (1*2 + 3*10)/4 = 32/4 = 8.0
+    assert!((mean - 8.0).abs() < 1e-9, "expected 8.0, got {mean}");
+}
+
+#[test]
+fn global_output_mean_survives_retain() {
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 2.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 100.0, 5.0);
+    model.add_weighted(Point2D::new(2.0, 2.0, range, range), 10.0, 3.0);
+    model.retain(|_p, output| output < 50.0);
+    let mean = model.global_output_mean().unwrap();
+    // Remaining: (w=1,o=2), (w=3,o=10). Weighted mean = (2+30)/4 = 8.0.
+    assert!((mean - 8.0).abs() < 1e-9, "expected 8.0, got {mean}");
+}
+
+// --- Renegade::predict_with_prior ---
+
+#[test]
+fn predict_with_prior_matches_manual_composition() {
+    // Wiring-correctness check, mirroring shrink_end_to_end_matches_manual_composition
+    // for Renegade::shrink(): predict_with_prior should equal training +
+    // querying + shrinking by hand, using whatever k/metric/bandwidth the
+    // model itself auto-selects (not hard-coded here, so this stays valid
+    // regardless of how ensure_trained()'s selection logic evolves).
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    let mut rng = SmallRng::seed_from_u64(99);
+    for _ in 0..40 {
+        let x: f64 = rng.gen_range(0.0..10.0);
+        let y: f64 = rng.gen_range(0.0..10.0);
+        model.add(Point2D::new(x, y, range, range), x + y);
+    }
+    let query = Point2D::new(3.0, 7.0, range, range);
+    let prior = 123.0;
+
+    let got = model.predict_with_prior(&query, prior);
+
+    let diag = model.diagnostics();
+    let k = diag.optimal_k.unwrap();
+    let (local_mean, dispersion) = if let Some(h) = diag.kernel_bandwidth {
+        let max_k = (model.len() as f64).sqrt().ceil() as usize;
+        let neighbors = model.query_k(&query, max_k);
+        (
+            neighbors.gaussian_weighted_mean(h),
+            neighbors.gaussian_dispersion(h),
+        )
+    } else {
+        let neighbors = model.query_k(&query, k);
+        (neighbors.weighted_mean(), neighbors.dispersion())
+    };
+    let expected = match dispersion {
+        Some(d) => {
+            let sv = model.local_signal_variance(&d).unwrap();
+            d.shrink_toward(prior, sv).estimate
+        }
+        None => local_mean,
+    };
+
+    assert!(
+        (got - expected).abs() < 1e-9,
+        "expected {expected}, got {got}"
+    );
+}
+
+#[test]
+fn predict_with_prior_trusts_local_mean_when_position_strongly_predicts_output() {
+    let range = (0.0, 20.0);
+    let mut model = Renegade::new();
+    // output = round(x): tight local agreement, but output varies a lot
+    // across the whole dataset -- global variance is large, local variance
+    // (near any single query) is small. Some jitter so points aren't
+    // literally identical.
+    for i in 0..200 {
+        let x = i as f64 * 0.1;
+        let jitter = if i % 2 == 0 { 0.01 } else { -0.01 };
+        // y varies trivially (not constant) — see comment in
+        // add_no_signal_cycle for why a constant feature is avoided here.
+        model.add(
+            Point2D::new(x, i as f64 * 1e-6, range, range),
+            x.round() + jitter,
+        );
+    }
+
+    let query = Point2D::new(10.0, 0.0, range, range);
+    let prior = 0.0; // far from the true local value (~10)
+    let shrunk = model.predict_with_prior(&query, prior);
+    let raw = model.predict(&query);
+
+    assert!(
+        (shrunk - raw).abs() < 1.0,
+        "expected shrunk prediction to stay close to the raw local mean when local signal is strong: raw={raw}, shrunk={shrunk}, prior={prior}"
+    );
+}
+
+#[test]
+fn predict_unaffected_by_predict_with_prior_existing() {
+    // predict() must remain the raw local mean -- shrinkage is opt-in via
+    // predict_with_prior, never predict()'s default.
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    let mut rng = SmallRng::seed_from_u64(7);
+    for _ in 0..30 {
+        let x: f64 = rng.gen_range(0.0..10.0);
+        let y: f64 = rng.gen_range(0.0..10.0);
+        model.add(Point2D::new(x, y, range, range), x + y);
+    }
+    let query = Point2D::new(5.0, 5.0, range, range);
+    let predicted = model.predict(&query);
+    let diag = model.diagnostics();
+    let k = diag.optimal_k.unwrap();
+    let expected = if let Some(h) = diag.kernel_bandwidth {
+        let max_k = (model.len() as f64).sqrt().ceil() as usize;
+        model.query_k(&query, max_k).gaussian_weighted_mean(h)
+    } else {
+        model.query_k(&query, k).weighted_mean()
+    };
+    assert!(
+        (predicted - expected).abs() < 1e-9,
+        "predict() must equal the raw (unshrunk) local mean: got {predicted}, expected {expected}"
+    );
+}

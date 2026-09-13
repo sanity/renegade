@@ -387,20 +387,116 @@ impl<P: DataPoint + Clone> Renegade<P> {
     /// Predict output using automatically determined K and weighted mean.
     /// For regression, may use Gaussian kernel weighting if it was selected
     /// during training as superior to hard-k + inverse-distance.
+    ///
+    /// This is the RAW local estimate — it does not shrink toward the
+    /// dataset's global mean. See [`Self::predict_with_prior`] for a
+    /// shrunk alternative, and its doc comment for why shrinkage is opt-in
+    /// here rather than `predict()`'s default (measured to make the
+    /// crate's own accuracy benchmarks worse, not better, in the general
+    /// case — see that method's docs for the numbers).
     pub fn predict(&mut self, query: &P) -> f64 {
+        let (neighbors, bandwidth) = self.query_for_predict(query);
+        match bandwidth {
+            Some(h) => neighbors.gaussian_weighted_mean(h),
+            None => neighbors.weighted_mean(),
+        }
+    }
+
+    /// Predict output using automatically determined K, shrunk toward a
+    /// caller-supplied `prior` by how much local evidence there is to trust:
+    ///
+    /// ```text
+    /// estimate = prior + λ·(local_mean − prior)
+    /// ```
+    ///
+    /// via the same [`Self::shrink`]/[`Dispersion::shrink_toward`] machinery
+    /// as the rest of this crate's shrinkage API, using
+    /// [`Self::local_signal_variance`] for the signal-variance term.
+    ///
+    /// **This was evaluated as `predict()`'s new DEFAULT and rejected** —
+    /// worth recording here since the obvious next question is "why is this
+    /// opt-in rather than automatic". Two independent shrinkage formulas
+    /// (this crate's `local_signal_variance` subtraction, and the more
+    /// direct `λ = n_eff/(n_eff + σ²_local/σ²_global)` ratio) were measured
+    /// against a reconstruction of the exact motivating scenario (a mostly-
+    /// flat regression target with a small, genuinely learnable localized
+    /// region — see `tests/`), plus this crate's own real-dataset LOO
+    /// benchmarks:
+    ///
+    /// - **auto_mpg** (real regression dataset): shrink-by-default RMSE
+    ///   2.5809 vs. raw 2.5746 — a small but real regression.
+    /// - **wine_quality** (real regression dataset): shrink-by-default RMSE
+    ///   0.7191 vs. raw 0.7537 — a genuine ~4.6% improvement.
+    /// - **Synthetic 92%-flat/8%-signal reconstruction**: shrink-by-default
+    ///   made BOTH the overall MSE (0.83–1.61 vs. 0.59 raw, both formulas
+    ///   worse) AND the signal-region MSE (4.65–14.21 vs. 1.47 raw, both
+    ///   formulas dramatically worse) worse than the raw local mean — the
+    ///   opposite of the intended effect on the exact case this was meant
+    ///   to fix.
+    ///
+    /// The mechanism: `local_signal_variance` (in either form) treats "this
+    /// neighborhood's own variance is unusually HIGH relative to the
+    /// dataset overall" as evidence of "no local signal, shrink hard" — but
+    /// a neighborhood straddling the BOUNDARY between a real signal region
+    /// and the flat background also has high local variance (a mix of two
+    /// true regimes, not noise), and gets shrunk just as hard, discarding a
+    /// local mean that was already a reasonable (if imperfect) estimate.
+    /// This is not a tuning issue — it's a structural property of using
+    /// local-vs-global variance comparison as a trust signal: it cannot
+    /// distinguish "no structure here" from "structure that changes
+    /// sharply right here", and the latter is arguably the case where a
+    /// routing decision matters most.
+    ///
+    /// Given a wrong default is worse than no default, shrinkage stays
+    /// opt-in. Use this method when you've evaluated it on your own data
+    /// and confirmed it helps rather than hurts.
+    pub fn predict_with_prior(&mut self, query: &P, prior: f64) -> f64 {
+        let (neighbors, bandwidth) = self.query_for_predict(query);
+        self.shrink_local_mean(&neighbors, bandwidth, prior)
+    }
+
+    /// Shared setup for `predict`/`predict_with_prior`: train if needed,
+    /// then fetch the neighbor set (and kernel bandwidth, if any) predict()
+    /// has always used.
+    fn query_for_predict(&mut self, query: &P) -> (Neighbors, Option<f64>) {
         self.ensure_trained();
         let k = self.optimal_k.unwrap();
-        if let Some(h) = self.kernel_bandwidth {
+        let bandwidth = self.kernel_bandwidth;
+        let neighbors = if let Some(_h) = bandwidth {
             // Gaussian kernel: query max_k neighbors so the kernel has a full
             // neighborhood to weight. The kernel itself does the "soft cutoff" —
             // distant neighbors contribute exponentially less.
             let max_k = (self.len() as f64).sqrt().ceil() as usize;
-            let neighbors = self.query_k(query, max_k);
-            neighbors.gaussian_weighted_mean(h)
+            self.query_k(query, max_k)
         } else {
-            let neighbors = self.query_k(query, k);
-            neighbors.weighted_mean()
-        }
+            self.query_k(query, k)
+        };
+        (neighbors, bandwidth)
+    }
+
+    /// Compute the (possibly Gaussian-kernel) local mean for `neighbors`,
+    /// then shrink it toward `prior` using `local_signal_variance` for the
+    /// signal-variance term. Falls back to the plain local mean whenever
+    /// there's no dispersion to shrink with (empty neighbors, or a Gaussian
+    /// bandwidth too small for any neighbor to contribute) or no global
+    /// variance to compare against (no training data — shouldn't occur via
+    /// `predict_with_prior`, which trains first, but this keeps the
+    /// fallback explicit rather than panicking).
+    fn shrink_local_mean(&self, neighbors: &Neighbors, bandwidth: Option<f64>, prior: f64) -> f64 {
+        let (local_mean, dispersion) = match bandwidth {
+            Some(h) => (
+                neighbors.gaussian_weighted_mean(h),
+                neighbors.gaussian_dispersion(h),
+            ),
+            None => (neighbors.weighted_mean(), neighbors.dispersion()),
+        };
+        let Some(dispersion) = dispersion else {
+            return local_mean;
+        };
+        let Some(signal_variance) = self.local_signal_variance(&dispersion) else {
+            return local_mean;
+        };
+        dispersion.shrink_toward(prior, signal_variance).estimate
     }
 
     /// Predict output using distance-trend extrapolation (auto K).
@@ -419,6 +515,23 @@ impl<P: DataPoint + Clone> Renegade<P> {
     pub fn predict_k_extrapolated(&self, query: &P, k: usize) -> ExtrapolatedPrediction {
         let neighbors = self.query_k(query, k);
         neighbors.extrapolate()
+    }
+
+    /// Weighted mean of every stored output — the running mean maintained
+    /// internally by the same West's-algorithm accumulator that backs
+    /// [`Self::global_output_variance`], exposed directly since it's already
+    /// computed as a byproduct. This is [`Self::predict`]'s default
+    /// shrinkage target.
+    ///
+    /// `None` under the same degenerate conditions as
+    /// `global_output_variance` (no data, or every instance weight
+    /// non-positive).
+    pub fn global_output_mean(&self) -> Option<f64> {
+        if self.output_weight_sum <= 0.0 {
+            None
+        } else {
+            Some(self.output_mean)
+        }
     }
 
     /// Weighted variance of every stored output, treating the whole training

@@ -163,6 +163,16 @@ so signal stays high and the local mean is trusted. It's a method-of-moments
 estimate (the same local/global variance split a one-way ANOVA uses), not a
 calibrated quantity — noisiest exactly when `effective_n` is small.
 
+`model.predict_with_prior(&query, prior)` wires the whole thing up through
+`predict()`'s own auto-selected K and kernel: train, query, and shrink toward
+`prior` in one call. **This is opt-in, not `predict()`'s default** — a
+mostly-flat target with a small genuinely-learnable region is exactly the
+case shrinkage is meant to help, and on a direct reconstruction of that case
+it measurably made both the flat-region AND the signal-region predictions
+*worse*, not better (see `Renegade::predict_with_prior`'s doc comment for the
+numbers and the mechanism). Evaluate it on your own data before reaching for
+it as a default.
+
 ### VP-Tree Indexing
 
 A vantage-point tree provides **exact** nearest neighbor search (not approximate) with any distance function. Queries are O(log n) average case — 347× faster than brute force at 10k points.
