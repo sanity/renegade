@@ -1,5 +1,5 @@
 use crate::neighbor::{Neighbor, Neighbors};
-use crate::{DataPoint, Renegade};
+use crate::{DataPoint, Dispersion, Renegade};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
@@ -857,5 +857,745 @@ fn gaussian_dispersion_weight_sum_decays_with_distance() {
     assert!(
         far_mass < 1e-3,
         "far kernel mass should be tiny, got {far_mass}"
+    );
+}
+
+// --- Dispersion::standard_error ---
+
+#[test]
+fn standard_error_single_neighbor_is_zero() {
+    // Documented limitation: with only one neighbor, variance is exactly 0
+    // by construction (nothing to compare it against), so standard_error()
+    // reports 0 rather than reflecting real estimation uncertainty.
+    let neighbors = Neighbors {
+        neighbors: vec![Neighbor {
+            distance: 0.4,
+            output: 7.0,
+            weight: 5.0,
+        }],
+    };
+    let d = neighbors.dispersion().unwrap();
+    assert_eq!(d.standard_error(), 0.0);
+}
+
+#[test]
+fn standard_error_uses_effective_n_not_weight_sum() {
+    // Unequal weights make Kish's effective_n diverge sharply from Σw
+    // (weight_sum), so a broken implementation that divides by weight_sum
+    // instead of effective_n gives a different, wrong number.
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 1.0,
+                output: 0.0,
+                weight: 1.0,
+            },
+            Neighbor {
+                distance: 1.0,
+                output: 10.0,
+                weight: 99.0,
+            },
+        ],
+    };
+    let d = neighbors.dispersion().unwrap();
+    // weight_sum = 100, effective_n = 100^2/(1+9801) = 10000/9802 ≈ 1.0202.
+    assert!(
+        (d.effective_n - 1.0202).abs() < 1e-3,
+        "sanity-check effective_n, got {}",
+        d.effective_n
+    );
+    let expected = (d.variance / d.effective_n).sqrt();
+    assert!(
+        (d.standard_error() - expected).abs() < 1e-9,
+        "expected {expected}, got {}",
+        d.standard_error()
+    );
+    // Dividing by weight_sum (100) instead would give a visibly different,
+    // much smaller number — confirm we are NOT doing that.
+    let wrong = (d.variance / d.weight_sum).sqrt();
+    assert!(
+        (d.standard_error() - wrong).abs() > 1e-3,
+        "standard_error() must not match the weight_sum-denominator formula"
+    );
+}
+
+#[test]
+fn standard_error_widely_disagreeing_outputs_matches_closed_form() {
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 1.0,
+                output: 0.0,
+                weight: 1.0,
+            },
+            Neighbor {
+                distance: 1.0,
+                output: 100.0,
+                weight: 1.0,
+            },
+        ],
+    };
+    let d = neighbors.dispersion().unwrap();
+    // variance = 2500, effective_n = 2 (equal weights) -> se = sqrt(1250).
+    let expected = 1250.0_f64.sqrt();
+    assert!(
+        (d.standard_error() - expected).abs() < 1e-6,
+        "expected {expected}, got {}",
+        d.standard_error()
+    );
+}
+
+#[test]
+fn standard_error_non_finite_propagates_nan() {
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 1.0,
+                output: f64::NAN,
+                weight: 1.0,
+            },
+            Neighbor {
+                distance: 1.0,
+                output: 5.0,
+                weight: 3.0,
+            },
+        ],
+    };
+    let d = neighbors.dispersion().unwrap();
+    assert!(d.standard_error().is_nan());
+}
+
+// --- Dispersion::shrink_toward ---
+
+#[test]
+fn shrink_toward_zero_signal_variance_fully_shrinks_to_prior() {
+    // Unequal weights so this isn't accidentally passing under a broken
+    // equal-weight implementation.
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 1.0,
+                output: 0.0,
+                weight: 1.0,
+            },
+            Neighbor {
+                distance: 1.0,
+                output: 100.0,
+                weight: 4.0,
+            },
+        ],
+    };
+    let d = neighbors.dispersion().unwrap();
+    assert!(d.standard_error() > 0.0, "sanity: se must be nonzero here");
+    let s = d.shrink_toward(9.0, 0.0);
+    assert_eq!(s.lambda, 0.0);
+    assert!(
+        (s.estimate - 9.0).abs() < 1e-12,
+        "expected full shrinkage to prior 9.0, got {}",
+        s.estimate
+    );
+}
+
+#[test]
+fn shrink_toward_huge_signal_variance_trusts_local_mean() {
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 1.0,
+                output: 20.0,
+                weight: 1.0,
+            },
+            Neighbor {
+                distance: 1.0,
+                output: 24.0,
+                weight: 7.0,
+            },
+        ],
+    };
+    let d = neighbors.dispersion().unwrap();
+    let s = d.shrink_toward(0.0, 1e12);
+    assert!(
+        (s.lambda - 1.0).abs() < 1e-6,
+        "expected lambda ~1, got {}",
+        s.lambda
+    );
+    assert!(
+        (s.estimate - d.mean).abs() < 1e-6,
+        "expected estimate ~= local mean {}, got {}",
+        d.mean,
+        s.estimate
+    );
+}
+
+#[test]
+fn shrink_toward_matches_closed_form_with_unequal_weights() {
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 2.0,
+                output: 3.0,
+                weight: 1.0,
+            },
+            Neighbor {
+                distance: 2.0,
+                output: 9.0,
+                weight: 5.0,
+            },
+        ],
+    };
+    let d = neighbors.dispersion().unwrap();
+    let prior = 4.0;
+    let signal_variance = 2.5;
+    let s = d.shrink_toward(prior, signal_variance);
+
+    let se = d.standard_error();
+    let expected_lambda = signal_variance / (signal_variance + se * se);
+    let expected_estimate = prior + expected_lambda * (d.mean - prior);
+
+    assert!(
+        (s.lambda - expected_lambda).abs() < 1e-12,
+        "expected lambda {expected_lambda}, got {}",
+        s.lambda
+    );
+    assert!(
+        (s.estimate - expected_estimate).abs() < 1e-9,
+        "expected estimate {expected_estimate}, got {}",
+        s.estimate
+    );
+    assert!((s.standard_error - se).abs() < 1e-12);
+}
+
+#[test]
+fn shrink_toward_single_exact_match_defaults_to_local_trust() {
+    // Single neighbor at distance 0: variance == 0 so standard_error() == 0.
+    // With signal_variance also 0, both terms of the denominator are zero —
+    // the documented degenerate case defaults to lambda = 1.
+    let neighbors = Neighbors {
+        neighbors: vec![Neighbor {
+            distance: 0.0,
+            output: 17.0,
+            weight: 6.0,
+        }],
+    };
+    let d = neighbors.dispersion().unwrap();
+    let s = d.shrink_toward(0.0, 0.0);
+    assert_eq!(s.lambda, 1.0);
+    assert!((s.estimate - 17.0).abs() < 1e-12);
+}
+
+#[test]
+fn shrink_toward_negative_signal_variance_clamped_to_zero() {
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 1.0,
+                output: 1.0,
+                weight: 2.0,
+            },
+            Neighbor {
+                distance: 1.0,
+                output: 5.0,
+                weight: 3.0,
+            },
+        ],
+    };
+    let d = neighbors.dispersion().unwrap();
+    let negative = d.shrink_toward(0.0, -50.0);
+    let zero = d.shrink_toward(0.0, 0.0);
+    assert_eq!(negative.lambda, zero.lambda);
+    assert!((negative.estimate - zero.estimate).abs() < 1e-12);
+}
+
+#[test]
+fn shrink_toward_nan_signal_variance_propagates_nan() {
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 1.0,
+                output: 1.0,
+                weight: 1.0,
+            },
+            Neighbor {
+                distance: 1.0,
+                output: 3.0,
+                weight: 2.0,
+            },
+        ],
+    };
+    let d = neighbors.dispersion().unwrap();
+    let s = d.shrink_toward(0.0, f64::NAN);
+    assert!(s.lambda.is_nan());
+    assert!(s.estimate.is_nan());
+}
+
+#[test]
+fn shrink_toward_non_finite_dispersion_propagates_nan() {
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 1.0,
+                output: f64::NAN,
+                weight: 1.0,
+            },
+            Neighbor {
+                distance: 1.0,
+                output: 5.0,
+                weight: 4.0,
+            },
+        ],
+    };
+    let d = neighbors.dispersion().unwrap();
+    let s = d.shrink_toward(0.0, 1.0);
+    assert!(s.lambda.is_nan());
+    assert!(s.estimate.is_nan());
+}
+
+#[test]
+fn shrink_toward_huge_instance_weights_no_overflow() {
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 1.0,
+                output: 1.0,
+                weight: 1e200,
+            },
+            Neighbor {
+                distance: 1.0,
+                output: 3.0,
+                weight: 4e200,
+            },
+        ],
+    };
+    let d = neighbors.dispersion().unwrap();
+    let s = d.shrink_toward(0.0, 1.0);
+    assert!(s.lambda.is_finite(), "got lambda {}", s.lambda);
+    assert!(s.estimate.is_finite(), "got estimate {}", s.estimate);
+    assert!((0.0..=1.0).contains(&s.lambda));
+}
+
+// --- Renegade::global_output_variance / local_signal_variance / shrink ---
+
+#[test]
+fn global_output_variance_empty_model_is_none() {
+    let model: Renegade<Point2D> = Renegade::new();
+    assert!(model.global_output_variance().is_none());
+}
+
+#[test]
+fn global_output_variance_all_identical_outputs_is_zero() {
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 5.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 5.0, 3.0);
+    model.add_weighted(Point2D::new(2.0, 2.0, range, range), 5.0, 0.2);
+    let v = model.global_output_variance().unwrap();
+    assert!(v.abs() < 1e-12, "expected ~0, got {v}");
+}
+
+#[test]
+fn global_output_variance_matches_manual_weighted_calc() {
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    // Unequal weights.
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 0.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 10.0, 3.0);
+    let v = model.global_output_variance().unwrap();
+    // Weighted mean = (1*0 + 3*10)/4 = 7.5.
+    // Variance = (1*(0-7.5)^2 + 3*(10-7.5)^2)/4 = (56.25 + 18.75)/4 = 18.75.
+    assert!((v - 18.75).abs() < 1e-9, "expected 18.75, got {v}");
+}
+
+#[test]
+fn global_output_variance_survives_retain() {
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 0.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 100.0, 5.0);
+    model.add_weighted(Point2D::new(2.0, 2.0, range, range), 10.0, 3.0);
+    // Drop the outlier point (output 100.0), leaving two points.
+    model.retain(|_p, output| output < 50.0);
+    let v = model.global_output_variance().unwrap();
+    // Remaining: (w=1,o=0), (w=3,o=10). Weighted mean = 30/4 = 7.5.
+    // Variance = (1*7.5^2 + 3*2.5^2)/4 = (56.25 + 18.75)/4 = 18.75.
+    assert!((v - 18.75).abs() < 1e-9, "expected 18.75, got {v}");
+}
+
+#[test]
+fn global_output_variance_huge_weights_no_overflow() {
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 1.0, 1e200);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 3.0, 4e200);
+    let v = model.global_output_variance().unwrap();
+    assert!(v.is_finite(), "got {v}");
+    assert!(v >= 0.0);
+}
+
+#[test]
+fn local_signal_variance_matches_global_when_local_variance_is_zero() {
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 0.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 10.0, 3.0);
+    let global = model.global_output_variance().unwrap();
+
+    let local = Dispersion::from_weighted_pairs(&[(2.0, 5.0)]); // variance 0
+    let signal = model.local_signal_variance(&local).unwrap();
+    assert!(
+        (signal - global).abs() < 1e-9,
+        "with zero local variance, signal should equal the full global variance: expected {global}, got {signal}"
+    );
+}
+
+#[test]
+fn local_signal_variance_is_zero_when_local_matches_global_spread() {
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 0.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 10.0, 3.0);
+    let global = model.global_output_variance().unwrap();
+
+    // A neighborhood exactly as spread out as the whole dataset carries no
+    // more signal than noise alone would produce.
+    let local = Dispersion::from_weighted_pairs(&[(1.0, 0.0), (3.0, 10.0)]);
+    assert!((local.variance - global).abs() < 1e-9, "sanity check");
+    let signal = model.local_signal_variance(&local).unwrap();
+    assert!(signal.abs() < 1e-9, "expected ~0 signal, got {signal}");
+}
+
+#[test]
+fn local_signal_variance_never_negative_when_local_exceeds_global() {
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    // Tight global spread...
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 4.9, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 5.1, 1.0);
+    // ...but a wildly disagreeing local neighborhood (more spread than the
+    // dataset as a whole — can happen with a small/unrepresentative k).
+    let local = Dispersion::from_weighted_pairs(&[(1.0, -1000.0), (1.0, 1000.0)]);
+    let signal = model.local_signal_variance(&local).unwrap();
+    assert_eq!(signal, 0.0, "signal variance must clamp at 0, got {signal}");
+}
+
+#[test]
+fn shrink_returns_none_for_empty_neighbors() {
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 1.0, 1.0);
+    let empty = Neighbors { neighbors: vec![] };
+    assert!(model.shrink(&empty, 0.0).is_none());
+}
+
+#[test]
+fn shrink_returns_none_for_untrained_model() {
+    let model: Renegade<Point2D> = Renegade::new();
+    let neighbors = Neighbors {
+        neighbors: vec![Neighbor {
+            distance: 1.0,
+            output: 5.0,
+            weight: 1.0,
+        }],
+    };
+    assert!(model.shrink(&neighbors, 0.0).is_none());
+}
+
+#[test]
+fn shrink_end_to_end_matches_manual_composition() {
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 0.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 10.0, 3.0);
+
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 1.0,
+                output: 4.0,
+                weight: 2.0,
+            },
+            Neighbor {
+                distance: 1.0,
+                output: 6.0,
+                weight: 5.0,
+            },
+        ],
+    };
+
+    let prior = 3.0;
+    let got = model.shrink(&neighbors, prior).unwrap();
+
+    let local = neighbors.dispersion().unwrap();
+    let global = model.global_output_variance().unwrap();
+    let signal_variance = (global - local.variance).max(0.0);
+    let expected = local.shrink_toward(prior, signal_variance);
+
+    assert!((got.lambda - expected.lambda).abs() < 1e-12);
+    assert!((got.estimate - expected.estimate).abs() < 1e-9);
+}
+
+// --- Regression tests from review (2026-09-13): catastrophic cancellation
+// and NaN-laundering in global_output_variance/local_signal_variance, and
+// overflow in shrink_toward's lambda for huge finite/infinite inputs. ---
+
+#[test]
+fn global_output_variance_survives_large_common_offset() {
+    // The naive one-pass "E[o^2] - E[o]^2" formula catastrophically cancels
+    // here: outputs share a large offset (1e8) but have a small, genuine
+    // spread. West's algorithm (what this crate actually uses) must not.
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 100_000_000.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 100_000_001.0, 1.0);
+    let v = model.global_output_variance().unwrap();
+    // Population variance of {1e8, 1e8+1} about their mean: 0.25.
+    assert!(
+        (v - 0.25).abs() < 1e-6,
+        "expected ~0.25, got {v} (naive E[o^2]-E[o]^2 would return ~0.0 here)"
+    );
+}
+
+#[test]
+fn global_output_variance_survives_huge_common_offset() {
+    // A much larger common offset (1e10, chosen well below 2^53 so mag+1/
+    // mag+2 and their mean remain exactly-enough representable — unlike
+    // 2^52-scale offsets, where the ULP is already 1.0 and there's no
+    // representable spread left to measure at all). At this scale the
+    // naive "E[o^2] - E[o]^2" formula squares values around 1e20, far
+    // beyond f64's ~15-17 significant digits, so it doesn't just round to
+    // 0 — it can return an arbitrarily wrong LARGE positive number, which
+    // `.max(0.0)` cannot catch since it's already positive.
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    let mag = 1e10_f64;
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), mag + 2.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), mag + 2.0, 1.0);
+    model.add_weighted(Point2D::new(2.0, 2.0, range, range), mag + 1.0, 1.0);
+    let v = model.global_output_variance().unwrap();
+    // Weighted population variance of {mag+2, mag+2, mag+1} about their
+    // mean (mag + 5/3): two points at +1/3 from the mean, one at -2/3:
+    // (2*(1/3)^2 + (2/3)^2) / 3 = (2/9 + 4/9)/3 = (6/9)/3 = 2/9 ≈ 0.2222.
+    assert!(
+        (v - 2.0 / 9.0).abs() < 1e-3,
+        "expected ~0.2222, got {v} (naive formula returns garbage at this magnitude)"
+    );
+}
+
+#[test]
+fn global_output_variance_nan_output_propagates_not_launders_to_zero() {
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 3.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 5.0, 1.0);
+    model.add_weighted(Point2D::new(2.0, 2.0, range, range), f64::NAN, 1.0);
+    let v = model.global_output_variance();
+    assert!(
+        v.is_some_and(|v| v.is_nan()),
+        "a NaN training output must produce Some(NaN), not a false Some(0.0); got {v:?}"
+    );
+
+    // The poisoning must not "heal" on later, perfectly finite adds either
+    // — it's a running accumulator, not recomputed per call.
+    model.add_weighted(Point2D::new(3.0, 3.0, range, range), 4.0, 1.0);
+    let v2 = model.global_output_variance();
+    assert!(
+        v2.is_some_and(|v| v.is_nan()),
+        "NaN contamination must persist across further adds; got {v2:?}"
+    );
+}
+
+#[test]
+fn global_output_variance_infinite_output_propagates_nan() {
+    // inf - inf (inside the variance formula) is NaN, not a finite number —
+    // must not be laundered to 0.0 either.
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 3.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), f64::INFINITY, 1.0);
+    let v = model.global_output_variance();
+    assert!(
+        v.is_some_and(|v| v.is_nan()),
+        "an infinite training output must not produce a false finite variance; got {v:?}"
+    );
+}
+
+#[test]
+fn local_signal_variance_nan_local_dispersion_propagates_nan() {
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 0.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 10.0, 3.0);
+
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 1.0,
+                output: f64::NAN,
+                weight: 1.0,
+            },
+            Neighbor {
+                distance: 1.0,
+                output: 5.0,
+                weight: 2.0,
+            },
+        ],
+    };
+    let local = neighbors.dispersion().unwrap();
+    assert!(local.variance.is_nan(), "sanity check");
+    let signal = model.local_signal_variance(&local);
+    assert!(
+        signal.is_some_and(|s| s.is_nan()),
+        "a NaN local dispersion must propagate as NaN, not clamp to 0; got {signal:?}"
+    );
+}
+
+#[test]
+fn global_output_variance_empty_after_retain_all_is_none() {
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 1.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 2.0, 1.0);
+    model.retain(|_p, _o| false);
+    assert!(model.is_empty());
+    assert!(
+        model.global_output_variance().is_none(),
+        "no data left after retain(|_| false) should mean no global variance"
+    );
+}
+
+#[test]
+fn global_output_variance_survives_force_retrain() {
+    // Running output sums are deliberately NOT touched by invalidate()
+    // (see the field docs) — confirm force_retrain() doesn't reset them.
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 1.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 9.0, 3.0);
+    let before = model.global_output_variance().unwrap();
+    model.force_retrain();
+    let after = model.global_output_variance().unwrap();
+    assert_eq!(before, after, "force_retrain must not disturb output sums");
+}
+
+#[test]
+fn shrink_toward_infinite_signal_variance_with_finite_noise_is_full_trust() {
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 1.0,
+                output: 1.0,
+                weight: 1.0,
+            },
+            Neighbor {
+                distance: 1.0,
+                output: 3.0,
+                weight: 5.0,
+            },
+        ],
+    };
+    let d = neighbors.dispersion().unwrap();
+    let s = d.shrink_toward(0.0, f64::INFINITY);
+    assert_eq!(
+        s.lambda, 1.0,
+        "infinite signal variance must give lambda exactly 1, not NaN"
+    );
+    assert!((s.estimate - d.mean).abs() < 1e-9);
+}
+
+/// Two finite, non-huge-weight outputs (1e200 and -1e200) whose squared
+/// deviations from their mean (0.0) overflow f64 to +Infinity — a
+/// `Dispersion` with genuinely infinite `variance` (not NaN), built through
+/// the crate's own weighted-variance formula rather than by directly
+/// injecting `f64::INFINITY` as an output.
+fn dispersion_with_infinite_variance() -> Dispersion {
+    let d = Dispersion::from_weighted_pairs(&[(1.0, 1e200), (1.0, -1e200)]);
+    assert!(
+        d.variance.is_infinite() && !d.variance.is_nan(),
+        "test helper sanity check: expected +inf variance, got {}",
+        d.variance
+    );
+    d
+}
+
+#[test]
+fn shrink_toward_infinite_noise_with_finite_signal_variance_is_full_prior() {
+    let d = dispersion_with_infinite_variance();
+    assert!(d.standard_error().is_infinite(), "sanity check");
+    let s = d.shrink_toward(7.0, 3.0);
+    assert_eq!(
+        s.lambda, 0.0,
+        "infinite noise (standard_error) with finite signal variance must give lambda exactly 0"
+    );
+    assert!((s.estimate - 7.0).abs() < 1e-9);
+}
+
+#[test]
+fn shrink_toward_both_infinite_is_nan() {
+    // Both signal_variance and standard_error() infinite: genuinely
+    // indeterminate (∞/∞), must be NaN, not silently pick a side.
+    let d = dispersion_with_infinite_variance();
+    let s = d.shrink_toward(0.0, f64::INFINITY);
+    assert!(
+        s.lambda.is_nan(),
+        "∞ signal_variance with ∞ standard_error is indeterminate, must be NaN, got {}",
+        s.lambda
+    );
+}
+
+#[test]
+fn shrink_toward_huge_finite_signal_and_noise_variance_near_f64_max() {
+    // Construct a neighborhood whose own noise_variance (standard_error()^2)
+    // is ~2.8125e307 (outputs 0.0 and 1.5e154, equal weight -> squared
+    // deviations sum to 1.125e308, safely under f64::MAX so `Dispersion`
+    // itself doesn't overflow; variance = 5.625e307, effective_n = 2).
+    // Pick signal_variance = 1.6e308 so the two terms are each individually
+    // finite and representable, but their naive sum (~1.88e308) exceeds
+    // f64::MAX (~1.7977e308) and overflows to +Infinity. A naive
+    // `signal_variance / (signal_variance + noise_variance)` would then
+    // compute `1.6e308 / Infinity == 0.0` — exactly backwards, since the
+    // true ratio (signal_variance is ~5.7x noise_variance) is ~0.85.
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 1.0,
+                output: 0.0,
+                weight: 1.0,
+            },
+            Neighbor {
+                distance: 1.0,
+                output: 1.5e154,
+                weight: 1.0,
+            },
+        ],
+    };
+    let d = neighbors.dispersion().unwrap();
+    assert!(
+        d.variance.is_finite() && (d.variance - 5.625e307).abs() / 5.625e307 < 1e-9,
+        "sanity: expected variance ~5.625e307, got {}",
+        d.variance
+    );
+    let noise_variance = d.standard_error() * d.standard_error();
+    let signal_variance = 1.6e308;
+    assert!(
+        (signal_variance + noise_variance).is_infinite(),
+        "sanity: naive sum must overflow to +Infinity here"
+    );
+    // Compute the expected ratio by scaling both terms down first (by the
+    // same factor, so the ratio is preserved) — the direct, unscaled
+    // division is exactly the overflow this test exists to catch, so it
+    // can't be used to derive the expectation either.
+    let scaled_sv = signal_variance / 1e300;
+    let scaled_nv = noise_variance / 1e300;
+    let expected_lambda = scaled_sv / (scaled_sv + scaled_nv);
+
+    let s = d.shrink_toward(0.0, signal_variance);
+    assert!(
+        s.lambda.is_finite(),
+        "lambda must stay finite even when the naive sum would overflow, got {}",
+        s.lambda
+    );
+    assert!(
+        (s.lambda - expected_lambda).abs() < 1e-6,
+        "expected lambda ~{expected_lambda}, got {}",
+        s.lambda
     );
 }

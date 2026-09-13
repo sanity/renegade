@@ -104,4 +104,130 @@ impl Dispersion {
             weight_sum,
         }
     }
+
+    /// Standard error of `mean`: `sqrt(variance / effective_n)`.
+    ///
+    /// Uses `effective_n` (Kish's effective sample size), never `weight_sum`
+    /// — this answers "how precisely is `mean` pinned down by roughly this
+    /// many independent-ish observations", which is `effective_n`'s job by
+    /// definition (see its doc comment). `weight_sum` is raw kernel mass;
+    /// dividing by it would conflate "how much evidence is nearby" with "how
+    /// many independent samples does that evidence represent", which for an
+    /// unbounded kernel (`dispersion()`) or a large uniform weight are not
+    /// the same number at all.
+    ///
+    /// Caveat: this is a plug-in estimator computed entirely from the
+    /// neighbors it was built from, so it inherits their limits. With a
+    /// single neighbor (or several neighbors that all agree exactly),
+    /// `variance` is exactly zero by construction — there is nothing in the
+    /// neighbor set itself to measure spread against — so `standard_error()`
+    /// reports 0 (maximal confidence) rather than reflecting the real
+    /// uncertainty of estimating a mean from few observations. Callers that
+    /// need a noise floor for small neighborhoods should combine this with a
+    /// separate estimate (e.g. [`crate::Renegade::local_signal_variance`]'s
+    /// global comparison) rather than trusting `standard_error()` alone at
+    /// low `effective_n`.
+    pub fn standard_error(&self) -> f64 {
+        (self.variance / self.effective_n).sqrt()
+    }
+
+    /// Empirical-Bayes (James-Stein form) shrinkage of `mean` toward a
+    /// caller-supplied `prior`:
+    ///
+    /// ```text
+    /// estimate = prior + λ · (mean − prior)
+    /// λ = signal_variance / (signal_variance + standard_error()²)
+    /// ```
+    ///
+    /// `prior` is domain knowledge the crate has no way to know — a global
+    /// mean, a baseline rate, the model's own global prediction, whatever
+    /// the caller would fall back to with zero local evidence. `signal_variance`
+    /// is the between-neighborhood variance of the TRUE target: how much
+    /// legitimate local signal is there to trust, as opposed to noise.
+    /// [`crate::Renegade::local_signal_variance`] estimates it per-query from
+    /// the model's own data; see its docs for why a single global constant
+    /// is the wrong shape for this — it means using a domain-specific prior.
+    ///
+    /// λ is the fraction of the gap between `prior` and `mean` that survives:
+    /// λ → 1 as the local estimate gets more precise (`standard_error` → 0)
+    /// or the neighborhood carries more real signal (`signal_variance` grows)
+    /// — trust the local mean fully. λ → 0 as the local estimate gets noisier
+    /// or the neighborhood carries no more signal than chance would produce
+    /// — fall back to the prior.
+    ///
+    /// `signal_variance` must be non-negative; NaN propagates, a negative
+    /// non-NaN value is clamped to 0 (fully shrink to the prior — treated as
+    /// "no local signal detected" rather than an error). When both
+    /// `signal_variance` and `standard_error()` are exactly zero — no signal
+    /// estimate AND no measured spread (e.g. a single exact-match neighbor)
+    /// — there is nothing to distinguish trusting the local mean from
+    /// trusting the prior; this degenerate case defaults to λ = 1 (trust the
+    /// local observation), matching how `Dispersion` itself treats a single
+    /// pair as its own whole population. An infinite `signal_variance` (with
+    /// a finite noise term) takes the λ → 1 limit exactly instead of the
+    /// `∞/∞` a direct division would produce; symmetrically an infinite
+    /// noise term (`standard_error() = ∞`) with finite `signal_variance`
+    /// takes the λ → 0 limit. `prior`, `mean`, and `standard_error` are NOT
+    /// specially handled beyond that: a non-finite `prior` or `mean` flows
+    /// into `estimate = prior + λ·(mean − prior)` via ordinary IEEE-754
+    /// arithmetic (e.g. an infinite `prior` typically yields an infinite or
+    /// NaN `estimate`, depending on `λ` and `mean`), it is not forced to NaN.
+    pub fn shrink_toward(&self, prior: f64, signal_variance: f64) -> Shrinkage {
+        let signal_variance = if signal_variance.is_nan() {
+            signal_variance
+        } else {
+            signal_variance.max(0.0)
+        };
+        let standard_error = self.standard_error();
+        let noise_variance = standard_error * standard_error;
+
+        let lambda = if signal_variance.is_nan() || noise_variance.is_nan() {
+            f64::NAN
+        } else if signal_variance.is_infinite() && noise_variance.is_infinite() {
+            // ∞/∞: genuinely indeterminate, no limit to take.
+            f64::NAN
+        } else if signal_variance.is_infinite() {
+            1.0
+        } else if noise_variance.is_infinite() {
+            0.0
+        } else {
+            // Both finite. Normalize by the larger of the two before
+            // summing, rather than computing `signal_variance / (signal_variance
+            // + noise_variance)` directly: two individually-representable
+            // values (e.g. both near f64::MAX) can sum to +Infinity, which
+            // would silently zero out a ratio that should land near 0.5.
+            // Dividing both terms by their max first keeps the sum <= 2.0.
+            let scale = signal_variance.max(noise_variance);
+            if scale > 0.0 {
+                let sv = signal_variance / scale;
+                let nv = noise_variance / scale;
+                (sv / (sv + nv)).clamp(0.0, 1.0)
+            } else {
+                // Both exactly 0.
+                1.0
+            }
+        };
+
+        Shrinkage {
+            estimate: prior + lambda * (self.mean - prior),
+            lambda,
+            standard_error,
+        }
+    }
+}
+
+/// Result of [`Dispersion::shrink_toward`]: a local mean pulled toward a
+/// prior by an amount that depends on how much the local evidence is worth
+/// trusting.
+#[derive(Debug, Clone)]
+pub struct Shrinkage {
+    /// `prior + lambda * (mean - prior)`.
+    pub estimate: f64,
+    /// Shrinkage weight in `[0, 1]`. `1.0` = fully trust the local mean,
+    /// `0.0` = fully fall back to the prior.
+    pub lambda: f64,
+    /// `Dispersion::standard_error()` of the local mean being shrunk —
+    /// carried through so callers can see the precision behind `lambda`
+    /// without recomputing it.
+    pub standard_error: f64,
 }

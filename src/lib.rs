@@ -9,7 +9,7 @@ pub mod vptree;
 pub use diagnostics::{
     FeatureDiagnostics, ModelDiagnostics, NeighborDetail, OutputStats, PredictionDiagnostics,
 };
-pub use dispersion::Dispersion;
+pub use dispersion::{Dispersion, Shrinkage};
 pub use metric::LearnedMetric;
 pub use neighbor::{Neighbor, Neighbors};
 pub use predict::ExtrapolatedPrediction;
@@ -65,6 +65,35 @@ pub struct Renegade<P: DataPoint> {
     /// Number of features per data point (0 until first point is added).
     num_features: usize,
 
+    // --- Running weighted variance for `global_output_variance` ---
+    // Maintained incrementally on `add_weighted` (O(1) per point) and
+    // recomputed from scratch on `retain` (already O(n) there) via
+    // `accumulate_output`/`recompute_output_sums`. Kept separate from the
+    // per-query `Dispersion` machinery in dispersion.rs: these describe the
+    // WHOLE dataset, not one neighbor set, and a query may run once per
+    // routing decision, so rescanning every stored point on every call would
+    // undo the amortized-training design this crate otherwise commits to.
+    //
+    // This uses West's incremental weighted variance (a weighted Welford's
+    // algorithm: track a running mean and update it before folding each new
+    // point into the second moment) rather than the more obvious "track
+    // Σw, Σw·o, Σw·o², derive variance as E[o²] − E[o]²" — that one-pass
+    // formula suffers catastrophic cancellation whenever the outputs share a
+    // large common offset relative to their true spread (e.g. two outputs
+    // 1e8 and 1e8+1 have variance 0.25, but E[o²]−E[o]² can round to 0, or
+    // for larger offsets to an arbitrarily wrong LARGE positive number — not
+    // bounded by "a few ULPs negative", so `.max(0.0)` does not save it).
+    // West's algorithm has no such cancellation regardless of magnitude,
+    // while remaining exactly O(1) amortized per point.
+    /// Σ instance_weight, over all stored points.
+    output_weight_sum: f64,
+    /// Running weighted mean of all stored outputs.
+    output_mean: f64,
+    /// Running weighted second moment about `output_mean` (West's
+    /// algorithm). `output_m2 / output_weight_sum` is the population
+    /// variance.
+    output_m2: f64,
+
     // --- Training state ---
     optimal_k: Option<usize>,
     learned_metric: Option<LearnedMetric>,
@@ -94,6 +123,9 @@ impl<P: DataPoint + Clone> Renegade<P> {
             outputs: Vec::new(),
             instance_weights: Vec::new(),
             num_features: 0,
+            output_weight_sum: 0.0,
+            output_mean: 0.0,
+            output_m2: 0.0,
             optimal_k: None,
             learned_metric: None,
             kernel_bandwidth: None,
@@ -132,6 +164,7 @@ impl<P: DataPoint + Clone> Renegade<P> {
         self.outputs.push(output);
         self.instance_weights.push(weight);
         self.points.push(point);
+        self.accumulate_output(weight, output);
 
         // Invalidate metric/K if dataset has grown 50% since last training
         if self.computed_at > 0 && self.len() >= self.computed_at + self.computed_at / 2 {
@@ -189,7 +222,36 @@ impl<P: DataPoint + Clone> Renegade<P> {
         self.outputs.truncate(write);
         self.instance_weights.truncate(write);
         self.values_flat.truncate(write * nf);
+        self.recompute_output_sums();
         self.invalidate();
+    }
+
+    /// Fold one more `(weight, output)` pair into the running weighted mean
+    /// and second moment (West's incremental algorithm — see the field docs
+    /// on `output_weight_sum` for why).
+    fn accumulate_output(&mut self, weight: f64, output: f64) {
+        self.output_weight_sum += weight;
+        let delta = output - self.output_mean;
+        self.output_mean += (weight / self.output_weight_sum) * delta;
+        let delta2 = output - self.output_mean;
+        self.output_m2 += weight * delta * delta2;
+    }
+
+    /// Recompute the running weighted mean/second-moment from scratch. Only
+    /// needed after a bulk removal (`retain`) — `add_weighted` maintains
+    /// them incrementally via `accumulate_output` since it only ever adds,
+    /// and West's algorithm has no way to "remove" a point from a running
+    /// mean/second-moment pair without redoing the fold.
+    fn recompute_output_sums(&mut self) {
+        self.output_weight_sum = 0.0;
+        self.output_mean = 0.0;
+        self.output_m2 = 0.0;
+        // Can't iterate-and-mutate via `zip` directly on `self`'s own
+        // fields; collect nothing extra though — just re-borrow per index.
+        for i in 0..self.outputs.len() {
+            let (w, o) = (self.instance_weights[i], self.outputs[i]);
+            self.accumulate_output(w, o);
+        }
     }
 
     /// Force recomputation of the metric and K on the next query.
@@ -357,6 +419,135 @@ impl<P: DataPoint + Clone> Renegade<P> {
     pub fn predict_k_extrapolated(&self, query: &P, k: usize) -> ExtrapolatedPrediction {
         let neighbors = self.query_k(query, k);
         neighbors.extrapolate()
+    }
+
+    /// Weighted variance of every stored output, treating the whole training
+    /// set as one population — `Σw(o - mean)² / Σw` over every point ever
+    /// added (and still present after any `retain`). This is the crate's
+    /// only "global" statistic; everything else (`Dispersion`, `Neighbors`)
+    /// describes one query's neighborhood.
+    ///
+    /// `None` if there is no data, or if every instance weight is
+    /// non-positive (the same degenerate case `Dispersion` falls back on —
+    /// see its `from_weighted_pairs`).
+    ///
+    /// A NaN or ±infinite stored output poisons this permanently (every
+    /// later call also reports NaN) rather than being silently discarded —
+    /// see the field docs on `output_weight_sum` for why this is computed
+    /// via West's algorithm instead of the more obvious "derive variance
+    /// from Σw/Σw·o/Σw·o²" formula, which both loses precision AND would
+    /// silently launder a NaN result to a confident-looking `Some(0.0)`
+    /// via a naive `.max(0.0)` clamp.
+    pub fn global_output_variance(&self) -> Option<f64> {
+        if self.output_weight_sum <= 0.0 {
+            return None;
+        }
+        let variance = self.output_m2 / self.output_weight_sum;
+        // Clamp tiny float noise to 0 (variance is mathematically >= 0),
+        // but only for an actually-finite result — `f64::max` silently
+        // picks the non-NaN operand, so `NaN.max(0.0) == 0.0`. Checking
+        // `is_nan()` first keeps a NaN (from a NaN/±Infinity stored output)
+        // visibly NaN instead of laundering it into a false "zero variance".
+        Some(if variance.is_nan() {
+            variance
+        } else {
+            variance.max(0.0)
+        })
+    }
+
+    /// Estimate the between-neighborhood ("signal") variance of the target
+    /// near a query, for use as `signal_variance` in
+    /// [`Dispersion::shrink_toward`].
+    ///
+    /// Decomposes the GLOBAL variance of every stored output into a LOCAL
+    /// component — `local.variance`, the given neighborhood's own dispersion,
+    /// treated as noise — and whatever variance is left over, attributed to
+    /// genuine local signal:
+    ///
+    /// ```text
+    /// signal_variance ≈ max(0, global_output_variance() − local.variance)
+    /// ```
+    ///
+    /// Rationale: a neighborhood whose outputs agree about as tightly as the
+    /// dataset overall (`local.variance ≈ global_output_variance()`) has
+    /// demonstrated no more structure than noise alone would produce —
+    /// signal ≈ 0, so `shrink_toward` shrinks hard toward the prior. A
+    /// neighborhood that agrees far more tightly than the dataset overall
+    /// (`local.variance` well below the global figure) has captured
+    /// something real; signal stays close to the global variance, so
+    /// `shrink_toward` keeps trusting the local mean.
+    ///
+    /// This is deliberately a PER-QUERY estimate, not a single global
+    /// constant. A single global "how much does the signal vary" number gets
+    /// inflated by any strongly localized effect elsewhere in the dataset —
+    /// a query sitting in a flat, no-signal region would still inherit that
+    /// inflated figure and keep `shrink_toward`'s λ high (trusting a noisy
+    /// local mean) exactly where it shouldn't. Comparing THIS neighborhood's
+    /// dispersion against the global figure, instead of using the global
+    /// figure alone, is what fixes that.
+    ///
+    /// Caveats — read before trusting this as a calibrated variance:
+    ///
+    /// - A neighbor set alone cannot distinguish "this neighborhood has low
+    ///   true variation" from "these particular k points happen to agree by
+    ///   chance". This is a method-of-moments point estimate (loosely the
+    ///   same subtraction a one-way ANOVA or a DerSimonian-Laird
+    ///   random-effects meta-analysis uses to split total variance into
+    ///   between- and within-group components, though those aggregate
+    ///   within-group variance across ALL groups — this substitutes a
+    ///   single neighborhood's own variance instead), not a hypothesis
+    ///   test, and it is noisiest exactly when `local.effective_n` is
+    ///   small — the same regime where [`Dispersion::standard_error`] is
+    ///   least trustworthy.
+    /// - It also assumes noise is roughly homoskedastic across
+    ///   neighborhoods. A neighborhood with a genuinely (not just by luck)
+    ///   lower noise floor than the dataset's average will have its signal
+    ///   systematically overestimated — this fixes the "one global constant
+    ///   inflated by other neighborhoods" failure mode described above, but
+    ///   does not fully separate signal from noise in general.
+    /// - `local` should come from THIS model's own `Neighbors::dispersion()`
+    ///   / `gaussian_dispersion()` — a `Dispersion` from elsewhere (or one
+    ///   hand-constructed with a negative `variance`, since its fields are
+    ///   public) is not clamped against and can produce a nonsensical
+    ///   result.
+    ///
+    /// Treat the result as a heuristic prior for shrinkage, not a calibrated
+    /// quantity.
+    ///
+    /// Returns `None` if there's no global variance to compare against (no
+    /// training data, or every instance weight non-positive). Propagates
+    /// NaN (rather than silently clamping it to 0) if `global_output_variance()`
+    /// or `local.variance` is NaN.
+    pub fn local_signal_variance(&self, local: &Dispersion) -> Option<f64> {
+        let global_variance = self.global_output_variance()?;
+        let signal_variance = global_variance - local.variance;
+        Some(if signal_variance.is_nan() {
+            signal_variance
+        } else {
+            signal_variance.max(0.0)
+        })
+    }
+
+    /// Convenience: shrink `neighbors.weighted_mean()` toward `prior`, using
+    /// this model's own local/global variance decomposition
+    /// ([`local_signal_variance`](Self::local_signal_variance)) as the
+    /// signal variance behind the shrinkage. This is the recommended entry
+    /// point for most callers — it wires together `Neighbors::dispersion`,
+    /// `local_signal_variance`, and `Dispersion::shrink_toward` with a
+    /// consistent, correct choice of signal variance, rather than each
+    /// caller re-deriving (and, empirically, mis-deriving) the same formula.
+    ///
+    /// Uses `neighbors.dispersion()` (the inverse-distance kernel matching
+    /// `weighted_mean()`), not `gaussian_dispersion` — call
+    /// `Dispersion::shrink_toward` directly if the Gaussian-kernel path is
+    /// what your `Neighbors` was built for.
+    ///
+    /// Returns `None` if `neighbors` is empty, or there is no training data
+    /// (or only non-positive instance weights) to compare against.
+    pub fn shrink(&self, neighbors: &Neighbors, prior: f64) -> Option<Shrinkage> {
+        let local = neighbors.dispersion()?;
+        let signal_variance = self.local_signal_variance(&local)?;
+        Some(local.shrink_toward(prior, signal_variance))
     }
 
     /// Ensure the metric and K are trained. Recomputes if needed.
