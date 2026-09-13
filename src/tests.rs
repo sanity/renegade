@@ -1332,3 +1332,270 @@ fn shrink_end_to_end_matches_manual_composition() {
     assert!((got.lambda - expected.lambda).abs() < 1e-12);
     assert!((got.estimate - expected.estimate).abs() < 1e-9);
 }
+
+// --- Regression tests from review (2026-09-13): catastrophic cancellation
+// and NaN-laundering in global_output_variance/local_signal_variance, and
+// overflow in shrink_toward's lambda for huge finite/infinite inputs. ---
+
+#[test]
+fn global_output_variance_survives_large_common_offset() {
+    // The naive one-pass "E[o^2] - E[o]^2" formula catastrophically cancels
+    // here: outputs share a large offset (1e8) but have a small, genuine
+    // spread. West's algorithm (what this crate actually uses) must not.
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 100_000_000.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 100_000_001.0, 1.0);
+    let v = model.global_output_variance().unwrap();
+    // Population variance of {1e8, 1e8+1} about their mean: 0.25.
+    assert!(
+        (v - 0.25).abs() < 1e-6,
+        "expected ~0.25, got {v} (naive E[o^2]-E[o]^2 would return ~0.0 here)"
+    );
+}
+
+#[test]
+fn global_output_variance_survives_huge_common_offset() {
+    // A much larger common offset (1e10, chosen well below 2^53 so mag+1/
+    // mag+2 and their mean remain exactly-enough representable — unlike
+    // 2^52-scale offsets, where the ULP is already 1.0 and there's no
+    // representable spread left to measure at all). At this scale the
+    // naive "E[o^2] - E[o]^2" formula squares values around 1e20, far
+    // beyond f64's ~15-17 significant digits, so it doesn't just round to
+    // 0 — it can return an arbitrarily wrong LARGE positive number, which
+    // `.max(0.0)` cannot catch since it's already positive.
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    let mag = 1e10_f64;
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), mag + 2.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), mag + 2.0, 1.0);
+    model.add_weighted(Point2D::new(2.0, 2.0, range, range), mag + 1.0, 1.0);
+    let v = model.global_output_variance().unwrap();
+    // Weighted population variance of {mag+2, mag+2, mag+1} about their
+    // mean (mag + 5/3): two points at +1/3 from the mean, one at -2/3:
+    // (2*(1/3)^2 + (2/3)^2) / 3 = (2/9 + 4/9)/3 = (6/9)/3 = 2/9 ≈ 0.2222.
+    assert!(
+        (v - 2.0 / 9.0).abs() < 1e-3,
+        "expected ~0.2222, got {v} (naive formula returns garbage at this magnitude)"
+    );
+}
+
+#[test]
+fn global_output_variance_nan_output_propagates_not_launders_to_zero() {
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 3.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 5.0, 1.0);
+    model.add_weighted(Point2D::new(2.0, 2.0, range, range), f64::NAN, 1.0);
+    let v = model.global_output_variance();
+    assert!(
+        v.is_some_and(|v| v.is_nan()),
+        "a NaN training output must produce Some(NaN), not a false Some(0.0); got {v:?}"
+    );
+
+    // The poisoning must not "heal" on later, perfectly finite adds either
+    // — it's a running accumulator, not recomputed per call.
+    model.add_weighted(Point2D::new(3.0, 3.0, range, range), 4.0, 1.0);
+    let v2 = model.global_output_variance();
+    assert!(
+        v2.is_some_and(|v| v.is_nan()),
+        "NaN contamination must persist across further adds; got {v2:?}"
+    );
+}
+
+#[test]
+fn global_output_variance_infinite_output_propagates_nan() {
+    // inf - inf (inside the variance formula) is NaN, not a finite number —
+    // must not be laundered to 0.0 either.
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 3.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), f64::INFINITY, 1.0);
+    let v = model.global_output_variance();
+    assert!(
+        v.is_some_and(|v| v.is_nan()),
+        "an infinite training output must not produce a false finite variance; got {v:?}"
+    );
+}
+
+#[test]
+fn local_signal_variance_nan_local_dispersion_propagates_nan() {
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 0.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 10.0, 3.0);
+
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 1.0,
+                output: f64::NAN,
+                weight: 1.0,
+            },
+            Neighbor {
+                distance: 1.0,
+                output: 5.0,
+                weight: 2.0,
+            },
+        ],
+    };
+    let local = neighbors.dispersion().unwrap();
+    assert!(local.variance.is_nan(), "sanity check");
+    let signal = model.local_signal_variance(&local);
+    assert!(
+        signal.is_some_and(|s| s.is_nan()),
+        "a NaN local dispersion must propagate as NaN, not clamp to 0; got {signal:?}"
+    );
+}
+
+#[test]
+fn global_output_variance_empty_after_retain_all_is_none() {
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 1.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 2.0, 1.0);
+    model.retain(|_p, _o| false);
+    assert!(model.is_empty());
+    assert!(
+        model.global_output_variance().is_none(),
+        "no data left after retain(|_| false) should mean no global variance"
+    );
+}
+
+#[test]
+fn global_output_variance_survives_force_retrain() {
+    // Running output sums are deliberately NOT touched by invalidate()
+    // (see the field docs) — confirm force_retrain() doesn't reset them.
+    let range = (0.0, 10.0);
+    let mut model = Renegade::new();
+    model.add_weighted(Point2D::new(0.0, 0.0, range, range), 1.0, 1.0);
+    model.add_weighted(Point2D::new(1.0, 1.0, range, range), 9.0, 3.0);
+    let before = model.global_output_variance().unwrap();
+    model.force_retrain();
+    let after = model.global_output_variance().unwrap();
+    assert_eq!(before, after, "force_retrain must not disturb output sums");
+}
+
+#[test]
+fn shrink_toward_infinite_signal_variance_with_finite_noise_is_full_trust() {
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 1.0,
+                output: 1.0,
+                weight: 1.0,
+            },
+            Neighbor {
+                distance: 1.0,
+                output: 3.0,
+                weight: 5.0,
+            },
+        ],
+    };
+    let d = neighbors.dispersion().unwrap();
+    let s = d.shrink_toward(0.0, f64::INFINITY);
+    assert_eq!(
+        s.lambda, 1.0,
+        "infinite signal variance must give lambda exactly 1, not NaN"
+    );
+    assert!((s.estimate - d.mean).abs() < 1e-9);
+}
+
+/// Two finite, non-huge-weight outputs (1e200 and -1e200) whose squared
+/// deviations from their mean (0.0) overflow f64 to +Infinity — a
+/// `Dispersion` with genuinely infinite `variance` (not NaN), built through
+/// the crate's own weighted-variance formula rather than by directly
+/// injecting `f64::INFINITY` as an output.
+fn dispersion_with_infinite_variance() -> Dispersion {
+    let d = Dispersion::from_weighted_pairs(&[(1.0, 1e200), (1.0, -1e200)]);
+    assert!(
+        d.variance.is_infinite() && !d.variance.is_nan(),
+        "test helper sanity check: expected +inf variance, got {}",
+        d.variance
+    );
+    d
+}
+
+#[test]
+fn shrink_toward_infinite_noise_with_finite_signal_variance_is_full_prior() {
+    let d = dispersion_with_infinite_variance();
+    assert!(d.standard_error().is_infinite(), "sanity check");
+    let s = d.shrink_toward(7.0, 3.0);
+    assert_eq!(
+        s.lambda, 0.0,
+        "infinite noise (standard_error) with finite signal variance must give lambda exactly 0"
+    );
+    assert!((s.estimate - 7.0).abs() < 1e-9);
+}
+
+#[test]
+fn shrink_toward_both_infinite_is_nan() {
+    // Both signal_variance and standard_error() infinite: genuinely
+    // indeterminate (∞/∞), must be NaN, not silently pick a side.
+    let d = dispersion_with_infinite_variance();
+    let s = d.shrink_toward(0.0, f64::INFINITY);
+    assert!(
+        s.lambda.is_nan(),
+        "∞ signal_variance with ∞ standard_error is indeterminate, must be NaN, got {}",
+        s.lambda
+    );
+}
+
+#[test]
+fn shrink_toward_huge_finite_signal_and_noise_variance_near_f64_max() {
+    // Construct a neighborhood whose own noise_variance (standard_error()^2)
+    // is ~2.8125e307 (outputs 0.0 and 1.5e154, equal weight -> squared
+    // deviations sum to 1.125e308, safely under f64::MAX so `Dispersion`
+    // itself doesn't overflow; variance = 5.625e307, effective_n = 2).
+    // Pick signal_variance = 1.6e308 so the two terms are each individually
+    // finite and representable, but their naive sum (~1.88e308) exceeds
+    // f64::MAX (~1.7977e308) and overflows to +Infinity. A naive
+    // `signal_variance / (signal_variance + noise_variance)` would then
+    // compute `1.6e308 / Infinity == 0.0` — exactly backwards, since the
+    // true ratio (signal_variance is ~5.7x noise_variance) is ~0.85.
+    let neighbors = Neighbors {
+        neighbors: vec![
+            Neighbor {
+                distance: 1.0,
+                output: 0.0,
+                weight: 1.0,
+            },
+            Neighbor {
+                distance: 1.0,
+                output: 1.5e154,
+                weight: 1.0,
+            },
+        ],
+    };
+    let d = neighbors.dispersion().unwrap();
+    assert!(
+        d.variance.is_finite() && (d.variance - 5.625e307).abs() / 5.625e307 < 1e-9,
+        "sanity: expected variance ~5.625e307, got {}",
+        d.variance
+    );
+    let noise_variance = d.standard_error() * d.standard_error();
+    let signal_variance = 1.6e308;
+    assert!(
+        (signal_variance + noise_variance).is_infinite(),
+        "sanity: naive sum must overflow to +Infinity here"
+    );
+    // Compute the expected ratio by scaling both terms down first (by the
+    // same factor, so the ratio is preserved) — the direct, unscaled
+    // division is exactly the overflow this test exists to catch, so it
+    // can't be used to derive the expectation either.
+    let scaled_sv = signal_variance / 1e300;
+    let scaled_nv = noise_variance / 1e300;
+    let expected_lambda = scaled_sv / (scaled_sv + scaled_nv);
+
+    let s = d.shrink_toward(0.0, signal_variance);
+    assert!(
+        s.lambda.is_finite(),
+        "lambda must stay finite even when the naive sum would overflow, got {}",
+        s.lambda
+    );
+    assert!(
+        (s.lambda - expected_lambda).abs() < 1e-6,
+        "expected lambda ~{expected_lambda}, got {}",
+        s.lambda
+    );
+}

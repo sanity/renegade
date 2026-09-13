@@ -155,8 +155,7 @@ impl Dispersion {
     /// or the neighborhood carries no more signal than chance would produce
     /// — fall back to the prior.
     ///
-    /// `signal_variance` must be non-negative; NaN propagates (as does a NaN
-    /// or infinite `prior`, `mean`, or `standard_error`), a negative
+    /// `signal_variance` must be non-negative; NaN propagates, a negative
     /// non-NaN value is clamped to 0 (fully shrink to the prior — treated as
     /// "no local signal detected" rather than an error). When both
     /// `signal_variance` and `standard_error()` are exactly zero — no signal
@@ -164,7 +163,15 @@ impl Dispersion {
     /// — there is nothing to distinguish trusting the local mean from
     /// trusting the prior; this degenerate case defaults to λ = 1 (trust the
     /// local observation), matching how `Dispersion` itself treats a single
-    /// pair as its own whole population.
+    /// pair as its own whole population. An infinite `signal_variance` (with
+    /// a finite noise term) takes the λ → 1 limit exactly instead of the
+    /// `∞/∞` a direct division would produce; symmetrically an infinite
+    /// noise term (`standard_error() = ∞`) with finite `signal_variance`
+    /// takes the λ → 0 limit. `prior`, `mean`, and `standard_error` are NOT
+    /// specially handled beyond that: a non-finite `prior` or `mean` flows
+    /// into `estimate = prior + λ·(mean − prior)` via ordinary IEEE-754
+    /// arithmetic (e.g. an infinite `prior` typically yields an infinite or
+    /// NaN `estimate`, depending on `λ` and `mean`), it is not forced to NaN.
     pub fn shrink_toward(&self, prior: f64, signal_variance: f64) -> Shrinkage {
         let signal_variance = if signal_variance.is_nan() {
             signal_variance
@@ -172,15 +179,33 @@ impl Dispersion {
             signal_variance.max(0.0)
         };
         let standard_error = self.standard_error();
-        let denom = signal_variance + standard_error * standard_error;
-        let lambda = if denom > 0.0 {
-            (signal_variance / denom).clamp(0.0, 1.0)
-        } else if denom == 0.0 {
-            1.0
-        } else {
-            // Unreachable for finite non-NaN inputs (both terms are
-            // non-negative), so only a NaN operand lands here.
+        let noise_variance = standard_error * standard_error;
+
+        let lambda = if signal_variance.is_nan() || noise_variance.is_nan() {
             f64::NAN
+        } else if signal_variance.is_infinite() && noise_variance.is_infinite() {
+            // ∞/∞: genuinely indeterminate, no limit to take.
+            f64::NAN
+        } else if signal_variance.is_infinite() {
+            1.0
+        } else if noise_variance.is_infinite() {
+            0.0
+        } else {
+            // Both finite. Normalize by the larger of the two before
+            // summing, rather than computing `signal_variance / (signal_variance
+            // + noise_variance)` directly: two individually-representable
+            // values (e.g. both near f64::MAX) can sum to +Infinity, which
+            // would silently zero out a ratio that should land near 0.5.
+            // Dividing both terms by their max first keeps the sum <= 2.0.
+            let scale = signal_variance.max(noise_variance);
+            if scale > 0.0 {
+                let sv = signal_variance / scale;
+                let nv = noise_variance / scale;
+                (sv / (sv + nv)).clamp(0.0, 1.0)
+            } else {
+                // Both exactly 0.
+                1.0
+            }
         };
 
         Shrinkage {
